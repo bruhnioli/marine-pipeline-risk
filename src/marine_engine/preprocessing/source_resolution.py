@@ -1,12 +1,17 @@
-"""Resolve PL854's EMODnet CDI source surveys to real acquisition provenance (MAR-006B).
+"""Resolve PL854's EMODnet CDI source surveys to real acquisition provenance (MAR-006B/006C).
 
 MAR-006 attributed every PL854 chainage station to one EMODnet
 `source_references` polygon and its QI classes, but left those polygons as
 opaque ids. This module follows each id's own official `metadata_url` to
 its SeaDataNet CDI record (`providers/bathymetry/cdi.py`) to recover who
-surveyed it, when, with what instrument, under what access terms, and
-whether the resulting ~115 m EMODnet composite could be replaced locally by
-requesting the original higher-resolution survey.
+surveyed it, when, with what instrument, under what access terms, and --
+separately -- whether CDI metadata actually confirms a resolution
+materially finer than the ~115 m EMODnet composite (see
+`cdi.classify_recovery_potential`). Access and confirmed resolution are
+deliberately independent: for PL854's three current records, a real
+request path exists (registration + owner negotiation) but no numeric
+resolution is stated, so `recovery_potential` correctly reports
+`SOURCE_RESOLUTION_UNKNOWN` rather than implying finer data is confirmed.
 
 Reuses `providers/bathymetry/inventory.py`'s pipeline/chainage-overlap and
 multi-epoch-segment machinery by wrapping each resolved source as a
@@ -463,7 +468,15 @@ def print_source_resolution_report(
     """Print the Section 18 required table plus the lettered A-F answers."""
 
     file = file or sys.stdout
-    lines = ["=== PL854 EMODnet CDI Source Resolution ===", ""]
+    lines = [
+        "=== PL854 EMODnet CDI Source Resolution ===",
+        "",
+        "NOTE: 'Access' (can this source be requested at all?) and",
+        "'Resolution/recovery' (does CDI metadata actually confirm a resolution",
+        "materially finer than the ~115 m EMODnet baseline?) are independent.",
+        "A requestable source is NOT automatically a confirmed higher-resolution one.",
+        "",
+    ]
 
     for _, row in df.iterrows():
         acquired = (
@@ -472,16 +485,16 @@ def print_source_resolution_report(
             else "unknown"
         )
         lines.append(f"--- {row['source_reference_id']} (CDI {row['cdi_identifier']}) ---")
-        lines.append(f"  Title:          {row['title']}")
-        lines.append(f"  Organisation:   {row['organisation']}")
-        lines.append(f"  Acquired:       {acquired}")
-        lines.append(f"  Method/device:  {row['survey_method']}")
+        lines.append(f"  Title:                {row['title']}")
+        lines.append(f"  Organisation:         {row['organisation']}")
+        lines.append(f"  Acquired:             {acquired}")
+        lines.append(f"  Method/device:        {row['survey_method']}")
         lines.append(
-            f"  PL854 chainage: {row['covered_station_count']} stations, "
+            f"  PL854 chainage:       {row['covered_station_count']} stations, "
             f"{row['pipeline_overlap_percent']:.1f}% of route, ranges {row['chainage_ranges']}"
         )
-        lines.append(f"  Access:         {row['access_class']}")
-        lines.append(f"  Recovery:       {row['recovery_potential']}")
+        lines.append(f"  Access:               {row['access_class']}")
+        lines.append(f"  Resolution/recovery:  {row['recovery_potential']}")
         lines.append("")
 
     acquisition_years = sorted({int(y) for y in df["acquisition_year"].dropna().unique()})
@@ -503,7 +516,8 @@ def print_source_resolution_report(
     for _, row in df.iterrows():
         lines.append(
             f"C. {row['source_reference_id']}: access={row['access_class']}, "
-            f"recovery={row['recovery_potential']}, request_identifier={row['request_identifier']}"
+            f"resolution_recovery={row['recovery_potential']}, "
+            f"request_identifier={row['request_identifier']}"
         )
 
     multiple_epochs = len(acquisition_years) > 1

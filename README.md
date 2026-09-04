@@ -153,7 +153,11 @@ in with `uv run pytest -m live`.
   (UKHO cruise HI524-HI525-HI531, instrument unstated) covering the
   remaining ~99%. All three are 32-33 years old at the 2024 release and
   require registration plus owner negotiation (via OceanWise/UKHO) to
-  request the original data -- none is directly downloadable. Output:
+  request the original data -- none is directly downloadable, and **none of
+  the three states a numeric spatial resolution**, so whether the original
+  source data is actually finer than the ~115 m EMODnet composite remains
+  unverified (see `MAR-006C` below) -- they are requestable/negotiable, not
+  confirmed higher-resolution products. Output:
   `data/interim/pl854/emodnet_cdi_sources.parquet`. The CDI report host
   fronts every request with a client-side proof-of-work challenge that a
   plain HTTP client cannot pass, so live automated resolution falls back to
@@ -171,5 +175,21 @@ in with `uv run pytest -m live`.
 
   Still no morphology, sediment/metocean, erosion/deposition,
   scour/free-span, or risk science, no ML, no web app, no LAT/MSL
-  conversion, and no SeaDataNet data request was submitted. No further
-  ticket has started.
+  conversion, and no SeaDataNet data request was submitted.
+- `MAR-006C`: provenance-semantics correction. MAR-006B's
+  `classify_recovery_potential()` had conflated "a request path exists"
+  with "higher resolution is confirmed" -- a source requestable via owner
+  negotiation was reported as `HIGH_RES_SOURCE_REQUESTABLE` even though
+  none of PL854's three CDI records state a numeric resolution (QI
+  instrument class, e.g. QI_Vertical=4 suggesting MBES, is not proof of
+  exported/grid resolution on its own). Fixed: `recovery_potential` now
+  requires CDI itself to state a real numeric resolution finer than
+  EMODnet's ~115 m baseline before returning a `HIGH_RES_*` value; for the
+  current three PL854 records it correctly reports
+  `SOURCE_RESOLUTION_UNKNOWN`, while `access_class`
+  (`OWNER_PERMISSION_REQUIRED` for all three) still separately and
+  accurately conveys that a real request path exists. Also moved this
+  ticket's own output from `data/processed/pl854/bathymetry/` to
+  `data/interim/pl854/` -- it is provenance-resolution metadata, not an
+  analysis-ready product; the canonical DTM and chainage-bathymetry outputs
+  are unaffected. No further ticket has started.

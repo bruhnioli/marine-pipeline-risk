@@ -461,18 +461,46 @@ def test_classify_access_unknown_when_no_information():
     assert cdi.classify_access(modified) == cdi.ACCESS_UNKNOWN
 
 
-def test_classify_recovery_potential_requestable_when_real_dataset_and_negotiation():
+def test_classify_recovery_potential_resolution_unknown_for_requestable_but_unstated_resolution():
+    """MAR-006C: this is the real state for all three current PL854 records --
+    a genuine request path exists (registration + owner negotiation), but CDI
+    states no numeric resolution, so recovery_potential must NOT claim
+    HIGH_RES_*. Access is still reported correctly via `classify_access`,
+    kept entirely separate from this field."""
+
     record = cdi.KNOWN_CDI_RECORDS["110153"]
     access_class = cdi.classify_access(record)
+
+    assert access_class == cdi.ACCESS_OWNER_PERMISSION_REQUIRED  # requestable IS still true
+    assert cdi.classify_recovery_potential(record, access_class) == cdi.RECOVERY_RESOLUTION_UNKNOWN
+
+
+def test_classify_recovery_potential_requestable_when_resolution_confirmed():
+    record = cdi.KNOWN_CDI_RECORDS["110153"]
+    confirmed = record.__class__(**{**record.__dict__, "horizontal_resolution_note": "2 Metres"})
     assert (
-        cdi.classify_recovery_potential(record, access_class) == cdi.RECOVERY_HIGH_RES_REQUESTABLE
+        cdi.classify_recovery_potential(confirmed, cdi.ACCESS_OWNER_PERMISSION_REQUIRED)
+        == cdi.RECOVERY_HIGH_RES_REQUESTABLE
     )
 
 
-def test_classify_recovery_potential_recoverable_for_direct_download():
+def test_classify_recovery_potential_recoverable_when_resolution_confirmed_and_direct_download():
     record = cdi.KNOWN_CDI_RECORDS["110153"]
-    assert cdi.classify_recovery_potential(record, cdi.ACCESS_DIRECT_DOWNLOAD) == (
+    confirmed = record.__class__(**{**record.__dict__, "vertical_resolution_note": "1 Metres"})
+    assert cdi.classify_recovery_potential(confirmed, cdi.ACCESS_DIRECT_DOWNLOAD) == (
         cdi.RECOVERY_HIGH_RES_RECOVERABLE
+    )
+
+
+def test_classify_recovery_potential_not_recoverable_when_restricted_even_with_confirmed_resolution():
+    """Access establishing the source cannot be obtained dominates, regardless
+    of whether resolution is confirmed."""
+
+    record = cdi.KNOWN_CDI_RECORDS["110153"]
+    confirmed = record.__class__(**{**record.__dict__, "horizontal_resolution_note": "2 Metres"})
+    assert (
+        cdi.classify_recovery_potential(confirmed, cdi.ACCESS_RESTRICTED)
+        == cdi.RECOVERY_NOT_RECOVERABLE
     )
 
 
@@ -485,6 +513,26 @@ def test_classify_recovery_potential_resolution_unknown_without_a_real_dataset()
     )
 
 
+def test_classify_recovery_potential_zero_resolution_note_does_not_count_as_confirmed():
+    """CDI's "0 Metres" convention means unspecified, not a real sub-metre claim."""
+
+    record = cdi.KNOWN_CDI_RECORDS["110153"]
+    assert record.horizontal_resolution_note is not None
+    assert "unspecified" in record.horizontal_resolution_note
+    assert (
+        cdi.classify_recovery_potential(record, cdi.ACCESS_DIRECT_DOWNLOAD)
+        == cdi.RECOVERY_RESOLUTION_UNKNOWN
+    )
+
+
+def test_classify_recovery_potential_qi_vertical_mbes_alone_is_not_proof_of_resolution():
+    """QI_Vertical=4 (MBES) must never substitute for a stated numeric resolution."""
+
+    record = cdi.KNOWN_CDI_RECORDS["121953"]  # QI_Vertical=4 in MAR-006, no stated resolution
+    access_class = cdi.classify_access(record)
+    assert cdi.classify_recovery_potential(record, access_class) == cdi.RECOVERY_RESOLUTION_UNKNOWN
+
+
 def test_classify_recovery_potential_never_claims_a_specific_resolution():
     """No CDI record here states a numeric resolution -- recovery_potential must
     never imply one (e.g. must not say "1 m data available")."""
@@ -493,6 +541,33 @@ def test_classify_recovery_potential_never_claims_a_specific_resolution():
     assert record.horizontal_resolution_note is not None
     assert "1 m" not in record.horizontal_resolution_note
     assert "1m" not in record.horizontal_resolution_note
+
+
+def test_access_classification_independent_of_recovery_classification():
+    """Changing only the resolution note must not change access_class, and
+    vice versa -- the two functions must never share hidden state."""
+
+    record = cdi.KNOWN_CDI_RECORDS["110153"]
+    access_before = cdi.classify_access(record)
+
+    confirmed = record.__class__(**{**record.__dict__, "horizontal_resolution_note": "2 Metres"})
+    access_after = cdi.classify_access(confirmed)
+
+    assert access_before == access_after == cdi.ACCESS_OWNER_PERMISSION_REQUIRED
+    assert cdi.classify_recovery_potential(
+        record, access_before
+    ) != cdi.classify_recovery_potential(confirmed, access_after)
+
+
+def test_extract_stated_resolution_m_treats_zero_as_unspecified():
+    assert cdi._extract_stated_resolution_m("0") is None
+    assert cdi._extract_stated_resolution_m("0 (source reports 0/unspecified)") is None
+    assert cdi._extract_stated_resolution_m(None) is None
+
+
+def test_extract_stated_resolution_m_parses_real_value():
+    assert cdi._extract_stated_resolution_m("2 Metres") == pytest.approx(2.0)
+    assert cdi._extract_stated_resolution_m("0.5") == pytest.approx(0.5)
 
 
 # --- known-snapshot integrity ------------------------------------------------
@@ -507,6 +582,25 @@ def test_known_cdi_records_have_the_resolved_real_epochs():
     assert cdi.KNOWN_CDI_RECORDS["110153"].acquisition_year == 1992
     assert cdi.KNOWN_CDI_RECORDS["121953"].acquisition_year == 1991
     assert cdi.KNOWN_CDI_RECORDS["121954"].acquisition_year == 1991
+
+
+def test_known_cdi_records_all_report_owner_permission_required_access():
+    for record in cdi.KNOWN_CDI_RECORDS.values():
+        assert cdi.classify_access(record) == cdi.ACCESS_OWNER_PERMISSION_REQUIRED
+
+
+def test_known_cdi_records_all_report_resolution_unknown_not_high_res():
+    """MAR-006C's expected real-world result (Section 7): a real request path
+    exists for all three current PL854 records, but none states a numeric
+    resolution, so none may be reported as a confirmed high-resolution
+    source. This is the exact regression this ticket exists to lock in."""
+
+    for source_reference_id, record in cdi.KNOWN_CDI_RECORDS.items():
+        access_class = cdi.classify_access(record)
+        recovery = cdi.classify_recovery_potential(record, access_class)
+        assert recovery == cdi.RECOVERY_RESOLUTION_UNKNOWN, (
+            f"{source_reference_id} unexpectedly resolved to {recovery!r}"
+        )
 
 
 def test_cdi_report_url_matches_the_real_pattern():

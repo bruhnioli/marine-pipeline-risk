@@ -400,9 +400,13 @@ def _cmd_resolve_bathymetry_sources(args: argparse.Namespace) -> int:
         print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
         return 1
 
-    pipeline_gpkg_path, aoi_gpkg_path, chainage_gpkg_path, _interim_dir = _study_paths(
+    pipeline_gpkg_path, aoi_gpkg_path, chainage_gpkg_path, interim_dir = _study_paths(
         config, pipeline_id
     )
+    # Canonical DTM / chainage-bathymetry stay under processed/<study>/bathymetry/
+    # (analysis-ready products); this command's own output is source/provenance
+    # *resolution* metadata, not an analysis-ready product, so it belongs under
+    # interim/<study>/ instead -- see MAR-006C.
     study_dir = config.paths.processed_dir / pipeline_id.lower()
     chainage_bathymetry_path = study_dir / "bathymetry" / "chainage_bathymetry.parquet"
 
@@ -449,8 +453,8 @@ def _cmd_resolve_bathymetry_sources(args: argparse.Namespace) -> int:
         working_crs=working_crs,
     )
 
-    parquet_path = study_dir / "bathymetry" / "emodnet_cdi_sources.parquet"
-    gpkg_path = study_dir / "bathymetry" / "emodnet_cdi_sources.gpkg"
+    parquet_path = interim_dir / "emodnet_cdi_sources.parquet"
+    gpkg_path = interim_dir / "emodnet_cdi_sources.gpkg"
     source_resolution.write_cdi_sources_parquet(df, parquet_path)
     source_resolution.write_cdi_sources_gpkg(records, working_crs, gpkg_path)
 

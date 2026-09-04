@@ -589,6 +589,53 @@ def test_resolve_bathymetry_sources_command_success(
     assert "Resolved 1 PL854 source-reference record" in out
 
 
+def test_resolve_bathymetry_sources_command_writes_output_under_interim_not_processed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MAR-006C: this is provenance-resolution metadata, not an analysis-ready
+    product -- it belongs under data/interim/<study>/, not data/processed/."""
+
+    from marine_engine.preprocessing import source_resolution
+    from marine_engine.providers.bathymetry import emodnet
+
+    config_path = _write_resolve_sources_fixture(tmp_path)
+
+    fake_df = pd.DataFrame(
+        [{"source_reference_id": "121954"}], columns=list(source_resolution.CDI_SOURCES_COLUMNS)
+    )
+    captured_paths: dict[str, Path] = {}
+    monkeypatch.setattr(emodnet, "fetch_source_references", lambda *a, **k: [])
+    monkeypatch.setattr(emodnet, "fetch_quality_index", lambda *a, **k: [])
+    monkeypatch.setattr(
+        source_resolution, "resolve_pl854_cdi_sources", lambda **k: (fake_df, [], [])
+    )
+
+    def fake_write_parquet(df, path):
+        captured_paths["parquet"] = path
+        return path
+
+    def fake_write_gpkg(records, working_crs, path):
+        captured_paths["gpkg"] = path
+        return None
+
+    monkeypatch.setattr(source_resolution, "write_cdi_sources_parquet", fake_write_parquet)
+    monkeypatch.setattr(source_resolution, "write_cdi_sources_gpkg", fake_write_gpkg)
+
+    exit_code = main(["resolve-bathymetry-sources", str(config_path)])
+
+    assert exit_code == 0
+    interim_dir = tmp_path / "interim" / "pl854"
+    processed_dir = tmp_path / "processed" / "pl854"
+    assert captured_paths["parquet"] == interim_dir / "emodnet_cdi_sources.parquet"
+    assert captured_paths["gpkg"] == interim_dir / "emodnet_cdi_sources.gpkg"
+    assert processed_dir not in captured_paths["parquet"].parents
+
+    # The canonical DTM / chainage-bathymetry inputs are still read from
+    # processed/<study>/bathymetry/ -- this command only redirects its OWN
+    # output, never the products it reads.
+    assert (processed_dir / "bathymetry" / "chainage_bathymetry.parquet").exists()
+
+
 def test_resolve_bathymetry_sources_command_reports_attribution_failure(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

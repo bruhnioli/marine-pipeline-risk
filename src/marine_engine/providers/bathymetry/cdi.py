@@ -52,6 +52,13 @@ QI_AGE_OLD_SURVEY_THRESHOLD_YEARS = (
     30  # QI_Age = 0 means "older than 30 years" (given, not derived)
 )
 
+# A CDI-stated resolution finer than this is "materially higher" than the
+# EMODnet composite's own ~115 m native grid (providers/bathymetry/emodnet.py
+# NATIVE_RESOLUTION_M) -- kept as a local constant rather than importing that
+# module, since this is a generic "beats the aggregate baseline" threshold,
+# not a dependency on EMODnet specifically.
+MATERIALLY_FINER_RESOLUTION_THRESHOLD_M = 115.0
+
 ACCESS_DIRECT_DOWNLOAD = "DIRECT_DOWNLOAD"
 ACCESS_SEADATANET_REQUEST = "SEADATANET_REQUEST"
 ACCESS_REGISTRATION_REQUIRED = "REGISTRATION_REQUIRED"
@@ -426,18 +433,63 @@ def classify_access(cdi_record: CdiRecord) -> str:
     return ACCESS_UNKNOWN
 
 
-def classify_recovery_potential(cdi_record: CdiRecord, access_class: str) -> str:
-    """Whether the underlying source could plausibly beat the ~115 m aggregate grid.
+def _extract_stated_resolution_m(note: str | None) -> float | None:
+    """A genuinely stated positive numeric resolution from a CDI note, or None.
 
-    A stated resolution number would make this a direct call; none of these
-    records state one (their "0 Metres" fields are unspecified, not a real
-    value -- see `parse_cdi_report_html`). Absent that, this falls back to
-    whether a genuine, concrete underlying dataset and access path exist at
-    all -- never claims a specific finer resolution the source didn't state.
+    CDI's own "0 Metres" convention means unspecified (see
+    `parse_cdi_report_html`'s handling of the raw "0" value) -- zero or a
+    missing note never counts as a real stated value here.
     """
+
+    if not note:
+        return None
+    match = re.match(r"([\d.]+)", note)
+    if not match:
+        return None
+    value = float(match.group(1))
+    return value if value > 0 else None
+
+
+def _confirms_materially_finer_resolution(cdi_record: CdiRecord) -> bool:
+    """True only if CDI itself states a numeric resolution finer than the aggregate baseline.
+
+    Deliberately does NOT look at QI instrument class (e.g. QI_Vertical=4
+    suggesting MBES) -- an instrument class is not proof of the exported/
+    gridded resolution actually available, only of the sounding technology
+    used during acquisition. See `classify_qi_vertical_consistency`'s
+    docstring for the same "not independent corroboration" reasoning.
+    """
+
+    for note in (cdi_record.horizontal_resolution_note, cdi_record.vertical_resolution_note):
+        value = _extract_stated_resolution_m(note)
+        if value is not None and value < MATERIALLY_FINER_RESOLUTION_THRESHOLD_M:
+            return True
+    return False
+
+
+def classify_recovery_potential(cdi_record: CdiRecord, access_class: str) -> str:
+    """Whether CDI metadata actually confirms materially finer-than-~115 m source data.
+
+    Deliberately separate from `access_class`: a source being requestable
+    does not by itself confirm it is higher-resolution. Only a genuinely
+    stated numeric resolution finer than the EMODnet baseline does that; QI
+    instrument class alone is never treated as proof (see
+    `_confirms_materially_finer_resolution`). For the current PL854 records,
+    none states a numeric resolution (their "0 Metres" fields are
+    unspecified), so all three correctly resolve to
+    `SOURCE_RESOLUTION_UNKNOWN` regardless of how confident QI_Vertical
+    looks -- being requestable is still reported, just via `access_class`,
+    not smuggled into this field.
+    """
+
+    if access_class == ACCESS_RESTRICTED:
+        return RECOVERY_NOT_RECOVERABLE
 
     has_real_dataset = bool(cdi_record.data_format) and cdi_record.data_size_mb is not None
     if not has_real_dataset:
+        return RECOVERY_RESOLUTION_UNKNOWN
+
+    if not _confirms_materially_finer_resolution(cdi_record):
         return RECOVERY_RESOLUTION_UNKNOWN
 
     if access_class == ACCESS_DIRECT_DOWNLOAD:
@@ -448,8 +500,6 @@ def classify_recovery_potential(cdi_record: CdiRecord, access_class: str) -> str
         ACCESS_OWNER_PERMISSION_REQUIRED,
     ):
         return RECOVERY_HIGH_RES_REQUESTABLE
-    if access_class in (ACCESS_RESTRICTED,):
-        return RECOVERY_NOT_RECOVERABLE
     return RECOVERY_RESOLUTION_UNKNOWN
 
 
