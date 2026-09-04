@@ -1,0 +1,63 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environments / secrets
+.env
+.env.*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# --- Geospatial / scientific data ---
+# Downloaded or derived datasets are never committed; only the directory
+# placeholders (.gitkeep) are tracked.
+data/raw/*
+data/interim/*
+data/processed/*
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+
+# Common large geospatial / scientific data formats, wherever they appear.
+*.tif
+*.tiff
+*.nc
+*.nc4
+*.grib
+*.grib2
+*.hdf
+*.h5
+*.zarr/
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qmd
+*.gpkg
+*.parquet
+*.las
+*.laz
+*.zip
+*.7z

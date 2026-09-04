@@ -1,0 +1,49 @@
+[project]
+name = "marine-engine"
+version = "0.1.0"
+description = "Seabed-risk modelling engine for subsea pipeline corridors (research PoC)."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "geopandas>=1.1.4",
+    "pyarrow>=25.0.1",
+    "pydantic>=2.13.5",
+    "pyproj>=3.7.2",
+    "pyyaml>=6.0.3",
+    "rasterio>=1.5.1",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+marine-engine = "marine_engine.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.5",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
+
+[tool.ruff.lint.per-file-ignores]
+# Embeds real (trimmed) XML survey-catalogue responses verbatim as test
+# fixtures; reflowing them would reduce their fidelity to what the live
+# services actually return.
+"tests/test_bathymetry_sources.py" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -m \"not live\""
+markers = [
+    "live: requires network access to the real NSTA ArcGIS service (excluded by default; run with -m live)",
+]

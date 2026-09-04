@@ -1,0 +1,58 @@
+# Study configuration for PL854 (Anglia A -> LOGGS), Southern North Sea.
+#
+# This is the first study case for the seabed-risk modelling engine. Fields
+# marked TODO are intentional placeholders for later tickets (e.g. vertical
+# datum). `pipeline.pipeline_id`/`route_bbox_wgs84` were confirmed against
+# the real NSTA geometry in MAR-002 (see src/marine_engine/providers/nsta.py);
+# `area_of_interest.corridor_buffer_m` drives the MAR-003 AOI build and
+# `pipeline.chainage_interval_m` drives the MAR-004 chainage build (see
+# src/marine_engine/preprocessing/{aoi,chainage}.py).
+
+study:
+  id: PL854
+  name: "PL854 Anglia A -> LOGGS"
+  description: >
+    Subsea pipeline corridor from the Anglia A platform to the LOGGS system,
+    Southern North Sea. First study case for the seabed-risk modelling engine.
+  design_life_years: 25  # placeholder; confirm against the real design basis.
+
+crs:
+  # UTM 31N confirmed (not just assumed) against the real PL854 geometry in
+  # MAR-002: the route's own longitude (~1.65-2.00 E) falls inside zone 31N,
+  # and NSTA's source metadata records the original survey CRS as EPSG:23031
+  # (ED50 / UTM 31N) -- i.e. NSTA's own provenance independently agrees on
+  # zone 31N. EPSG:32631 (the WGS84 realisation of that zone) is used rather
+  # than EPSG:23031 because the ingested geometry is itself WGS84.
+  horizontal: "EPSG:32631"
+  vertical: null  # TODO: select a vertical datum once bathymetry sources are chosen.
+
+area_of_interest:
+  # bbox_wgs84 is deliberately left unset: the AOI polygon in
+  # data/processed/pl854/aoi.gpkg (MAR-003) is the authoritative spatial
+  # extent. Later providers should derive bounds reproducibly from that
+  # file rather than a frozen copy here, which could go stale.
+  bbox_wgs84: null
+  corridor_buffer_m: 5000  # confirmed in MAR-003; drives `marine-engine build-aoi`.
+
+paths:
+  raw_dir: data/raw
+  interim_dir: data/interim
+  processed_dir: data/processed
+
+providers: {}
+preprocessing: {}
+morphology: {}
+sediment: {}
+metocean: {}
+pipeline:
+  # Confirmed in MAR-002 by ingesting the real NSTA geometry (NSTAPIPNO field).
+  pipeline_id: PL854
+  # Bounding box of the ingested PL854 route geometry itself (EPSG:4326),
+  # not a study AOI -- the buffered corridor AOI is MAR-003, not this.
+  route_bbox_wgs84: [1.6516061, 53.3678022, 2.0019739, 53.3892292]
+  # Regular chainage/KP station spacing for `marine-engine build-chainage`
+  # (MAR-004). Drives the calculation; never hard-coded in chainage.py.
+  chainage_interval_m: 25
+risk: {}
+validation: {}
+export: {}
