@@ -486,10 +486,99 @@ def test_classify_recovery_potential_requestable_when_resolution_confirmed():
 
 def test_classify_recovery_potential_recoverable_when_resolution_confirmed_and_direct_download():
     record = cdi.KNOWN_CDI_RECORDS["110153"]
-    confirmed = record.__class__(**{**record.__dict__, "vertical_resolution_note": "1 Metres"})
+    confirmed = record.__class__(**{**record.__dict__, "horizontal_resolution_note": "1 Metres"})
     assert cdi.classify_recovery_potential(confirmed, cdi.ACCESS_DIRECT_DOWNLOAD) == (
         cdi.RECOVERY_HIGH_RES_RECOVERABLE
     )
+
+
+# --- MAR-006D: horizontal resolution only, never vertical alone -------------
+
+
+def test_horizontal_resolution_5m_requestable_is_high_res_requestable():
+    """Ticket's exact scenario: horizontal_resolution = 5 m + requestable
+    -> HIGH_RES_SOURCE_REQUESTABLE."""
+
+    record = cdi.KNOWN_CDI_RECORDS["110153"]
+    confirmed = record.__class__(**{**record.__dict__, "horizontal_resolution_note": "5 Metres"})
+    assert (
+        cdi.classify_recovery_potential(confirmed, cdi.ACCESS_OWNER_PERMISSION_REQUIRED)
+        == cdi.RECOVERY_HIGH_RES_REQUESTABLE
+    )
+
+
+def test_horizontal_unknown_vertical_half_metre_is_still_resolution_unknown():
+    """Ticket's exact scenario: horizontal_resolution unknown + vertical_resolution
+    = 0.5 m -> SOURCE_RESOLUTION_UNKNOWN. This is the MAR-006D regression test:
+    a sub-metre VERTICAL accuracy must never be read as horizontal spatial
+    resolution, however fine it looks."""
+
+    record = cdi.KNOWN_CDI_RECORDS["110153"]
+    vertical_only = record.__class__(
+        **{
+            **record.__dict__,
+            "horizontal_resolution_note": None,
+            "vertical_resolution_note": "0.5 Metres",
+        }
+    )
+    access_class = cdi.classify_access(vertical_only)
+    assert cdi.classify_recovery_potential(vertical_only, access_class) == (
+        cdi.RECOVERY_RESOLUTION_UNKNOWN
+    )
+    # The vertical figure must still be preserved as metadata, just unused here.
+    assert vertical_only.vertical_resolution_note == "0.5 Metres"
+
+
+def test_horizontal_5m_vertical_unknown_is_high_res_per_access_class():
+    """Ticket's exact scenario: horizontal_resolution = 5 m + vertical_resolution
+    unknown -> HIGH_RES_SOURCE_* according to access class (never depends on
+    vertical_resolution_note being present at all)."""
+
+    record = cdi.KNOWN_CDI_RECORDS["110153"]
+    horizontal_only = record.__class__(
+        **{
+            **record.__dict__,
+            "horizontal_resolution_note": "5 Metres",
+            "vertical_resolution_note": None,
+        }
+    )
+    assert cdi.classify_recovery_potential(horizontal_only, cdi.ACCESS_DIRECT_DOWNLOAD) == (
+        cdi.RECOVERY_HIGH_RES_RECOVERABLE
+    )
+    assert cdi.classify_recovery_potential(
+        horizontal_only, cdi.ACCESS_OWNER_PERMISSION_REQUIRED
+    ) == (cdi.RECOVERY_HIGH_RES_REQUESTABLE)
+
+
+def test_qi_instrument_class_alone_never_changes_recovery_result():
+    """Ticket's exact scenario: QI/instrument class alone never changes this
+    result -- confirmed MBES survey_method with no stated horizontal
+    resolution must still be SOURCE_RESOLUTION_UNKNOWN, and a confirmed
+    horizontal resolution must resolve the same way regardless of
+    survey_method / QI_Vertical."""
+
+    record = cdi.KNOWN_CDI_RECORDS["121953"]  # QI_Vertical=4 in MAR-006
+    mbes_confirmed = record.__class__(
+        **{**record.__dict__, "survey_method": "multibeam echosounder"}
+    )
+    access_class = cdi.classify_access(mbes_confirmed)
+    assert cdi.classify_recovery_potential(mbes_confirmed, access_class) == (
+        cdi.RECOVERY_RESOLUTION_UNKNOWN
+    )
+
+    with_horizontal_res = record.__class__(
+        **{**record.__dict__, "survey_method": "unknown", "horizontal_resolution_note": "5 Metres"}
+    )
+    with_horizontal_res_and_mbes = record.__class__(
+        **{
+            **record.__dict__,
+            "survey_method": "multibeam echosounder",
+            "horizontal_resolution_note": "5 Metres",
+        }
+    )
+    assert cdi.classify_recovery_potential(
+        with_horizontal_res, access_class
+    ) == cdi.classify_recovery_potential(with_horizontal_res_and_mbes, access_class)
 
 
 def test_classify_recovery_potential_not_recoverable_when_restricted_even_with_confirmed_resolution():

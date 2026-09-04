@@ -52,11 +52,14 @@ QI_AGE_OLD_SURVEY_THRESHOLD_YEARS = (
     30  # QI_Age = 0 means "older than 30 years" (given, not derived)
 )
 
-# A CDI-stated resolution finer than this is "materially higher" than the
-# EMODnet composite's own ~115 m native grid (providers/bathymetry/emodnet.py
-# NATIVE_RESOLUTION_M) -- kept as a local constant rather than importing that
-# module, since this is a generic "beats the aggregate baseline" threshold,
-# not a dependency on EMODnet specifically.
+# A CDI-stated HORIZONTAL resolution finer than this is "materially higher"
+# than the EMODnet composite's own ~115 m native grid
+# (providers/bathymetry/emodnet.py NATIVE_RESOLUTION_M) -- kept as a local
+# constant rather than importing that module, since this is a generic
+# "beats the aggregate baseline" threshold, not a dependency on EMODnet
+# specifically. Applies only to horizontal spatial/grid resolution -- never
+# to vertical resolution/accuracy, which is a different physical quantity
+# (MAR-006D).
 MATERIALLY_FINER_RESOLUTION_THRESHOLD_M = 115.0
 
 ACCESS_DIRECT_DOWNLOAD = "DIRECT_DOWNLOAD"
@@ -451,32 +454,45 @@ def _extract_stated_resolution_m(note: str | None) -> float | None:
 
 
 def _confirms_materially_finer_resolution(cdi_record: CdiRecord) -> bool:
-    """True only if CDI itself states a numeric resolution finer than the aggregate baseline.
+    """True only if CDI states a HORIZONTAL spatial resolution finer than the aggregate baseline.
 
-    Deliberately does NOT look at QI instrument class (e.g. QI_Vertical=4
-    suggesting MBES) -- an instrument class is not proof of the exported/
-    gridded resolution actually available, only of the sounding technology
-    used during acquisition. See `classify_qi_vertical_consistency`'s
-    docstring for the same "not independent corroboration" reasoning.
+    Deliberately looks at `horizontal_resolution_note` only. Two things are
+    explicitly NOT evidence of horizontal spatial/grid resolution, however
+    finely they are stated, and must never trigger a `HIGH_RES_SOURCE_*`
+    result on their own:
+
+    - `vertical_resolution_note` -- vertical resolution/accuracy is a
+      statement about how precisely depth is measured, not about how
+      densely the survey samples the seabed horizontally. A sub-metre
+      vertical accuracy says nothing about grid/point spacing (MAR-006D).
+    - QI instrument class (e.g. QI_Vertical=4 suggesting MBES) -- an
+      instrument class is not proof of the exported/gridded resolution
+      actually available, only of the sounding technology used during
+      acquisition. See `classify_qi_vertical_consistency`'s docstring for
+      the same "not independent corroboration" reasoning (MAR-006C).
+
+    `vertical_resolution_note` itself is still preserved as metadata
+    elsewhere (`CdiRecord.vertical_resolution_note`, the output
+    dataframe's `vertical_accuracy_or_resolution` column) -- only its use
+    *here*, to decide horizontal recovery potential, is excluded.
     """
 
-    for note in (cdi_record.horizontal_resolution_note, cdi_record.vertical_resolution_note):
-        value = _extract_stated_resolution_m(note)
-        if value is not None and value < MATERIALLY_FINER_RESOLUTION_THRESHOLD_M:
-            return True
-    return False
+    value = _extract_stated_resolution_m(cdi_record.horizontal_resolution_note)
+    return value is not None and value < MATERIALLY_FINER_RESOLUTION_THRESHOLD_M
 
 
 def classify_recovery_potential(cdi_record: CdiRecord, access_class: str) -> str:
-    """Whether CDI metadata actually confirms materially finer-than-~115 m source data.
+    """Whether CDI metadata actually confirms materially finer-than-~115 m HORIZONTAL resolution.
 
     Deliberately separate from `access_class`: a source being requestable
     does not by itself confirm it is higher-resolution. Only a genuinely
-    stated numeric resolution finer than the EMODnet baseline does that; QI
-    instrument class alone is never treated as proof (see
-    `_confirms_materially_finer_resolution`). For the current PL854 records,
-    none states a numeric resolution (their "0 Metres" fields are
-    unspecified), so all three correctly resolve to
+    stated numeric *horizontal* spatial/grid resolution finer than the
+    EMODnet baseline does that -- vertical resolution/accuracy and QI
+    instrument class are both explicitly excluded, neither being evidence
+    of horizontal sampling density (see
+    `_confirms_materially_finer_resolution`). For the current PL854
+    records, none states a numeric horizontal resolution (their "0 Metres"
+    fields are unspecified), so all three correctly resolve to
     `SOURCE_RESOLUTION_UNKNOWN` regardless of how confident QI_Vertical
     looks -- being requestable is still reported, just via `access_class`,
     not smuggled into this field.
