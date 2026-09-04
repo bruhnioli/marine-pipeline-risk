@@ -43,9 +43,9 @@ entry point over that config system.
 Beyond the NSTA provider (MAR-002), AOI/chainage preprocessing
 (MAR-003/004), bathymetry source discovery (MAR-005), the canonical
 EMODnet baseline DTM (MAR-006), CDI source-survey resolution (MAR-006B),
-broad regional seabed morphology (MAR-007), and the PL854 sediment
-evidence base (MAR-008), the stage packages contain no algorithms yet —
-see "Status" below.
+broad regional seabed morphology (MAR-007), the PL854 sediment evidence
+base (MAR-008), and the PL854 metocean forcing evidence base (MAR-009),
+the stage packages contain no algorithms yet — see "Status" below.
 
 ## Project layout
 
@@ -77,14 +77,23 @@ uv run marine-engine build-bathymetry configs/pl854.yaml
 uv run marine-engine resolve-bathymetry-sources configs/pl854.yaml
 uv run marine-engine build-regional-morphology configs/pl854.yaml
 uv run marine-engine build-sediment-evidence configs/pl854.yaml
+uv run marine-engine build-metocean-evidence configs/pl854.yaml
 ```
 
 `ingest-pipeline`, `discover-bathymetry`, `fetch-bathymetry`,
 `build-bathymetry`, `resolve-bathymetry-sources`, `build-regional-morphology`,
-and `build-sediment-evidence` require network access to public services
-(NSTA, MEDIN, BGS GeoNetwork/ArcGIS REST, EMODnet, SeaDataNet CDI).
-Their live-source smoke tests are excluded from the default test run; opt
-in with `uv run pytest -m live`.
+`build-sediment-evidence`, and `build-metocean-evidence` require network
+access to public services (NSTA, MEDIN, BGS GeoNetwork/ArcGIS REST,
+EMODnet, SeaDataNet CDI, Copernicus Marine). Their live-source smoke tests
+are excluded from the default test run; opt in with `uv run pytest -m live`.
+
+`build-metocean-evidence` additionally requires a (free) Copernicus Marine
+account: catalogue metadata is public, but real data acquisition needs
+`uv run copernicusmarine login` (or the `COPERNICUSMARINE_SERVICE_USERNAME`
+/ `COPERNICUSMARINE_SERVICE_PASSWORD` environment variables) run once,
+outside of any AI assistant, before this command's real acquisition steps
+can proceed -- it stops with a clear `CopernicusAuthenticationRequiredError`
+otherwise, never an interactive credential prompt.
 
 ## Status
 
@@ -315,5 +324,68 @@ in with `uv run pytest -m live`.
   "surface evidence = present-day seabed sediment" -- `surface_evidence_class`
   is a vertical-position/sampling-relationship classification at collection
   time only (see the `MAR-008` bullet above); no age cutoff was introduced,
-  and real surface/subsurface classifications were not changed. No further
-  ticket has started.
+  and real surface/subsurface classifications were not changed.
+- `MAR-009`: PL854 metocean forcing evidence base
+  (`providers/metocean/{copernicus,acquisition}.py`,
+  `metocean/{current,wave,evidence}.py`) from three separate, never-blended
+  Copernicus Marine products, each mapped from the 941 dense chainage
+  stations onto a much smaller set of real model grid cells ("support
+  nodes") via nearest-wet-cell assignment -- never 941 fabricated
+  independent time series, never bilinear interpolation of data or masks:
+
+  1. **Primary current** -- `NWSHELF_ANALYSISFORECAST_PHY_004_013`
+     (`cmems_mod_nws_phy-cur_anfc_1.5km-3D_PT1H-i`, confirmed live): ~1.5 km
+     3D hourly instantaneous current. Per support node/hour, the **deepest
+     valid standard level** with finite `uo`/`vo` is selected and stored as
+     `deepest_valid_standard_level_current` -- explicitly **NOT** the
+     model's native terrain-following bottom cell, and never called
+     "bottom current"/"seabed current" anywhere in the codebase (naming
+     enforced by a schema-regression test). `height_above_model_bed_m` is
+     carried alongside and flagged if negative.
+  2. **Long-term surface current context** --
+     `NWSHELF_MULTIYEAR_PHY_004_009`
+     (`cmems_mod_nws_phy-uv_my_7km-2D_PT1H-i`, confirmed live, 1993
+     onward): `LONG_TERM_SURFACE_CURRENT_CONTEXT` role only, hourly
+     instantaneous 2D surface current -- never the daily 3D mean on the
+     same product (`cmems_mod_nws_phy-uv_my_7km-3D_P1D-m`, a 25-hour
+     tide-removing average, explicitly forbidden as a hard rule), never
+     used to fill a missing primary-current value, never downscaled.
+  3. **Wave climate** -- `NWSHELF_REANALYSIS_WAV_004_015`
+     (`MetO-NWS-WAV-RAN`, confirmed live, 1980 onward): 3-hourly `VHM0`/
+     `VTPK`/`VTM02`/`VTM10`/`VMDR` (+ Stokes drift where available). `VMDR`
+     is preserved as the raw wave FROM-direction
+     (`wave_mean_direction_from_deg`); a TO-direction is only ever derived
+     for convenience, never replacing the original.
+
+  Current direction (`current_direction_to_deg`) and wave direction
+  (`wave_mean_direction_from_deg`) use opposite conventions by design (TO
+  vs FROM) and are never confused or arithmetic-averaged -- directional
+  summaries use proper circular statistics. Model bathymetry (`deptho` on
+  each product's own static dataset) and the canonical MAR-006
+  `depth_lat_m` (LAT datum) are carried side by side, never subtracted or
+  compared as an "error"
+  (`canonical_model_bathymetry_vertical_datums_not_harmonised = true` in
+  the metadata). Historical forcing evidence is cut off at least 48 hours
+  behind the live analysis/forecast boundary, computed dynamically from
+  the actual dataset time coordinates each run, never hard-coded.
+  Acquisition uses the official Copernicus Marine Toolbox
+  (`copernicusmarine`) with resumable, idempotent monthly/yearly chunks; a
+  short-window surface-current-context ratio is reported as a descriptive
+  diagnostic only, never a scale factor or bias correction.
+
+  Real execution against PL854 (2026-09-04): all three dataset ids were
+  confirmed live against the current Copernicus Marine catalogue
+  successfully. Real data acquisition then stopped cleanly at
+  `CopernicusAuthenticationRequiredError` -- no Copernicus Marine
+  credentials are configured in this environment -- printing the exact
+  `copernicusmarine login` steps an operator needs to run, per this
+  ticket's explicit requirement to never attempt an interactive credential
+  prompt or ask for a password/token in chat. The full pipeline (support-
+  node mapping, deepest-valid-level selection, statistics, chainage
+  assembly, metadata) is implemented and verified with 88 new offline
+  tests plus opt-in live catalogue-reachability smoke tests; it has not
+  yet processed real Copernicus current/wave data end-to-end pending that
+  one-time authentication step. No bed shear stress, Shields parameter,
+  sediment mobility, wave orbital velocity, erosion/deposition, scour,
+  free-span, fatigue, or risk scoring is computed anywhere in this ticket.
+  No further ticket has started.

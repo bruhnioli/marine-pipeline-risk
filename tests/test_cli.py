@@ -924,3 +924,125 @@ def test_build_sediment_evidence_command_reports_bgs_failure(
 
     assert exit_code == 1
     assert "simulated BGS outage" in capsys.readouterr().err
+
+
+def test_build_metocean_evidence_command_requires_pipeline_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "no_pipeline.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-metocean-evidence", str(config_path)])
+
+    assert exit_code == 1
+    assert "pipeline.pipeline_id" in capsys.readouterr().err
+
+
+def test_build_metocean_evidence_command_requires_aoi_and_chainage(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_minimal_study_config(tmp_path)
+
+    exit_code = main(["build-metocean-evidence", str(config_path)])
+
+    assert exit_code == 1
+    assert "build-aoi and build-chainage first" in capsys.readouterr().err
+
+
+def _write_metocean_evidence_fixture(tmp_path: Path) -> Path:
+    """A minimal on-disk study: config + pipeline + AOI + chainage (2 stations)."""
+
+    processed_dir = tmp_path / "processed"
+    interim_dir = tmp_path / "interim"
+    config_path = tmp_path / "study.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n"
+        f"paths:\n  processed_dir: {processed_dir}\n  interim_dir: {interim_dir}\n"
+        "pipeline:\n  pipeline_id: PL854\n",
+        encoding="utf-8",
+    )
+
+    study_dir = processed_dir / "pl854"
+    study_dir.mkdir(parents=True, exist_ok=True)
+
+    route = LineString([(500000.0, 5900000.0), (500100.0, 5900000.0)])
+    pipeline_gdf = gpd.GeoDataFrame(
+        [{"pipeline_id": "PL854", "source": "test", "status": "ACTIVE"}],
+        geometry=[route],
+        crs="EPSG:32631",
+    )
+    pipeline_gdf.to_file(study_dir / "pipeline.gpkg", driver="GPKG", layer="pipeline")
+
+    aoi_gdf = gpd.GeoDataFrame(
+        [{"study_id": "PL854"}], geometry=[route.buffer(50.0)], crs="EPSG:32631"
+    )
+    aoi_gdf.to_file(study_dir / "aoi.gpkg", driver="GPKG", layer="study_aoi")
+
+    chainage_gdf = gpd.GeoDataFrame(
+        [
+            {"pipeline_id": "PL854", "station_index": 0, "chainage_m": 0.0, "kp_label": "KP 0+000"},
+            {
+                "pipeline_id": "PL854",
+                "station_index": 1,
+                "chainage_m": 100.0,
+                "kp_label": "KP 0+100",
+            },
+        ],
+        geometry=[Point(500000.0, 5900000.0), Point(500100.0, 5900000.0)],
+        crs="EPSG:32631",
+    )
+    chainage_gdf.to_file(study_dir / "chainage_25m.gpkg", driver="GPKG", layer="chainage_points")
+
+    return config_path
+
+
+def test_build_metocean_evidence_command_reports_dataset_not_found(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Section 2/6 of the ticket: never guess a stale dataset id -- stop and report cleanly."""
+
+    from marine_engine.providers.metocean import copernicus
+
+    config_path = _write_metocean_evidence_fixture(tmp_path)
+
+    def raise_not_found(*a, **k):
+        raise copernicus.CopernicusDatasetNotFoundError("simulated: dataset id no longer listed")
+
+    monkeypatch.setattr(copernicus, "confirm_live_dataset_id", raise_not_found)
+
+    exit_code = main(["build-metocean-evidence", str(config_path)])
+
+    assert exit_code == 1
+    assert "simulated: dataset id no longer listed" in capsys.readouterr().err
+
+
+def test_build_metocean_evidence_command_reports_authentication_required(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Section 3/32 of the ticket: stop cleanly and tell the operator what to run -- never an
+    interactive credential prompt, never asking the user to paste a password into Claude."""
+
+    from marine_engine.providers.metocean import copernicus
+
+    config_path = _write_metocean_evidence_fixture(tmp_path)
+
+    monkeypatch.setattr(
+        copernicus,
+        "confirm_live_dataset_id",
+        lambda product_id, expected_dataset_id: expected_dataset_id,
+    )
+
+    def raise_auth_required():
+        raise copernicus.CopernicusAuthenticationRequiredError(
+            "simulated: Copernicus Marine credentials are not configured"
+        )
+
+    monkeypatch.setattr(copernicus, "ensure_authenticated", raise_auth_required)
+
+    exit_code = main(["build-metocean-evidence", str(config_path)])
+
+    assert exit_code == 1
+    assert "Copernicus Marine credentials are not configured" in capsys.readouterr().err

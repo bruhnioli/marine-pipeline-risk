@@ -6,11 +6,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
+import xarray as xr
 from shapely.ops import unary_union
 
 from marine_engine import __version__
 from marine_engine.config import load_study_config
+from marine_engine.metocean import evidence as metocean_evidence
 from marine_engine.morphology import regional
 from marine_engine.preprocessing import bathymetry, source_resolution
 from marine_engine.preprocessing.aoi import (
@@ -27,6 +30,8 @@ from marine_engine.preprocessing.chainage import (
     print_chainage_report,
 )
 from marine_engine.providers.bathymetry import acquisition, bgs, emodnet, inventory, ukho
+from marine_engine.providers.metocean import acquisition as metocean_acquisition
+from marine_engine.providers.metocean import copernicus
 from marine_engine.providers.nsta import (
     AmbiguousPipelineError,
     InvalidGeometryError,
@@ -798,6 +803,590 @@ def _cmd_build_sediment_evidence(args: argparse.Namespace) -> int:
     return 0
 
 
+def _mask_surface_slice(mask: xr.DataArray) -> xr.DataArray:
+    """The surface-level slice of a mask variable that may or may not have a depth dimension."""
+
+    if "depth" in mask.dims:
+        return mask.isel(depth=0)
+    return mask
+
+
+def _acquire_static_dataset(
+    *,
+    manifest_path: Path,
+    raw_dir: Path,
+    product_id: str,
+    dataset_id: str,
+    variables: list,
+    bbox_wgs84: tuple,
+    evidence_role: str,
+) -> xr.Dataset:
+    requested_bbox = list(bbox_wgs84)
+    existing = metocean_acquisition.already_acquired(
+        manifest_path,
+        product_id=product_id,
+        dataset_id=dataset_id,
+        variables=variables,
+        requested_bbox=requested_bbox,
+        requested_depths=None,
+        requested_start=metocean_acquisition.STATIC_TIME_SENTINEL,
+        requested_end=metocean_acquisition.STATIC_TIME_SENTINEL,
+    )
+    if existing is not None:
+        return xr.open_dataset(existing["local_path"])
+
+    result = copernicus.subset_dataset(
+        dataset_id=dataset_id,
+        variables=variables,
+        minimum_longitude=bbox_wgs84[0],
+        maximum_longitude=bbox_wgs84[2],
+        minimum_latitude=bbox_wgs84[1],
+        maximum_latitude=bbox_wgs84[3],
+        start_datetime=None,
+        end_datetime=None,
+        minimum_depth=None,
+        maximum_depth=None,
+        output_directory=raw_dir,
+        output_filename=f"{dataset_id}_static.nc",
+    )
+    metocean_acquisition.record_acquisition(
+        manifest_path,
+        provider="Copernicus Marine",
+        product_id=product_id,
+        dataset_id=dataset_id,
+        evidence_role=evidence_role,
+        variables=variables,
+        requested_bbox=requested_bbox,
+        requested_depths=None,
+        requested_start=None,
+        requested_end=None,
+        actual_start=None,
+        actual_end=None,
+        temporal_resolution="static",
+        local_path=result.local_path,
+        toolbox_version=copernicus.toolbox_version(),
+        licence=None,
+        downloaded_at=datetime.now(UTC),
+    )
+    return xr.open_dataset(result.local_path)
+
+
+def _acquire_chunked_dataset(
+    *,
+    manifest_path: Path,
+    raw_dir: Path,
+    product_id: str,
+    dataset_id: str,
+    variables: list,
+    bbox_wgs84: tuple,
+    depth_range: tuple | None,
+    chunk_ranges: list,
+    evidence_role: str,
+    temporal_resolution: str,
+) -> xr.Dataset | None:
+    """Acquire every chunk (resuming from the manifest), then open+concat them.
+
+    Never re-downloads a chunk whose exact identity (product/dataset/
+    variables/bbox/depths/start/end) is already manifested with its file
+    still on disk (Section 15).
+    """
+
+    requested_bbox = list(bbox_wgs84)
+    requested_depths = list(depth_range) if depth_range else None
+    chunk_paths: list[Path] = []
+
+    for chunk_start, chunk_end in chunk_ranges:
+        existing = metocean_acquisition.already_acquired(
+            manifest_path,
+            product_id=product_id,
+            dataset_id=dataset_id,
+            variables=variables,
+            requested_bbox=requested_bbox,
+            requested_depths=requested_depths,
+            requested_start=chunk_start.isoformat(),
+            requested_end=chunk_end.isoformat(),
+        )
+        if existing is not None:
+            chunk_paths.append(Path(existing["local_path"]))
+            continue
+
+        result = copernicus.subset_dataset(
+            dataset_id=dataset_id,
+            variables=variables,
+            minimum_longitude=bbox_wgs84[0],
+            maximum_longitude=bbox_wgs84[2],
+            minimum_latitude=bbox_wgs84[1],
+            maximum_latitude=bbox_wgs84[3],
+            start_datetime=chunk_start,
+            end_datetime=chunk_end,
+            minimum_depth=depth_range[0] if depth_range else None,
+            maximum_depth=depth_range[1] if depth_range else None,
+            output_directory=raw_dir,
+            output_filename=f"{dataset_id}_{chunk_start:%Y%m%d}_{chunk_end:%Y%m%d}.nc",
+        )
+        with xr.open_dataset(result.local_path) as chunk_ds:
+            actual_start = (
+                str(chunk_ds["time"].min().values) if "time" in chunk_ds.variables else None
+            )
+            actual_end = (
+                str(chunk_ds["time"].max().values) if "time" in chunk_ds.variables else None
+            )
+
+        metocean_acquisition.record_acquisition(
+            manifest_path,
+            provider="Copernicus Marine",
+            product_id=product_id,
+            dataset_id=dataset_id,
+            evidence_role=evidence_role,
+            variables=variables,
+            requested_bbox=requested_bbox,
+            requested_depths=requested_depths,
+            requested_start=chunk_start,
+            requested_end=chunk_end,
+            actual_start=actual_start,
+            actual_end=actual_end,
+            temporal_resolution=temporal_resolution,
+            local_path=result.local_path,
+            toolbox_version=copernicus.toolbox_version(),
+            licence=None,
+            downloaded_at=datetime.now(UTC),
+        )
+        chunk_paths.append(result.local_path)
+
+    if not chunk_paths:
+        return None
+    if len(chunk_paths) == 1:
+        return xr.open_dataset(chunk_paths[0])
+    return xr.open_mfdataset([str(p) for p in chunk_paths], combine="by_coords")
+
+
+def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    _pipeline_gpkg_path, aoi_gpkg_path, chainage_gpkg_path, interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+    chainage_bathymetry_path = study_dir / "bathymetry" / "chainage_bathymetry.parquet"
+
+    if not aoi_gpkg_path.exists() or not chainage_gpkg_path.exists():
+        print(
+            f"error: no canonical AOI/chainage found under {aoi_gpkg_path.parent}; "
+            "run build-aoi and build-chainage first",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        aoi_gdf = gpd.read_file(aoi_gpkg_path, layer="study_aoi")
+        chainage_gdf = gpd.read_file(chainage_gpkg_path, layer="chainage_points")
+    except Exception as exc:  # noqa: BLE001 -- one clear message regardless of the underlying cause
+        print(f"error: could not load canonical AOI/chainage: {exc}", file=sys.stderr)
+        return 1
+
+    canonical_depth_df = None
+    if chainage_bathymetry_path.exists():
+        canonical_depth_df = pd.read_parquet(chainage_bathymetry_path)[
+            ["station_index", "depth_lat_m"]
+        ]
+
+    working_crs = config.crs.horizontal
+    # A modest extra buffer beyond the AOI so the model bbox request
+    # comfortably contains at least one real wet cell even near a coastline.
+    request_buffer_m = 5000.0
+    aoi_geom_working = unary_union(aoi_gdf.geometry).buffer(request_buffer_m)
+    aoi_bbox_wgs84 = tuple(
+        float(v)
+        for v in gpd.GeoSeries([aoi_geom_working], crs=working_crs).to_crs("EPSG:4326").total_bounds
+    )
+    chainage_points_working = chainage_gdf.to_crs(working_crs).geometry
+
+    print("Resolving live Copernicus Marine dataset ids...")
+    try:
+        primary_current_dataset_id = copernicus.confirm_live_dataset_id(
+            copernicus.PRIMARY_CURRENT_PRODUCT_ID, copernicus.PRIMARY_CURRENT_DATASET_ID
+        )
+        long_term_current_dataset_id = copernicus.confirm_live_dataset_id(
+            copernicus.LONG_TERM_CURRENT_PRODUCT_ID, copernicus.LONG_TERM_CURRENT_DATASET_ID
+        )
+        wave_dataset_id = copernicus.confirm_live_dataset_id(
+            copernicus.WAVE_PRODUCT_ID, copernicus.WAVE_DATASET_ID
+        )
+    except copernicus.CopernicusDatasetNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        copernicus.ensure_authenticated()
+    except copernicus.CopernicusAuthenticationRequiredError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    metocean_interim_dir = interim_dir / "metocean"
+    metocean_processed_dir = config.paths.processed_dir / pipeline_id.lower() / "metocean"
+    raw_dir = config.paths.raw_dir / "metocean" / "copernicus"
+    manifest_path = metocean_interim_dir / "copernicus_acquisition_manifest.json"
+
+    now_utc = datetime.now(UTC)
+    historical_cutoff = metocean_acquisition.compute_historical_cutoff(now_utc)
+
+    # --- static bathymetry/mask for each product -------------------------
+    primary_static_ds = _acquire_static_dataset(
+        manifest_path=manifest_path,
+        raw_dir=raw_dir / "statics",
+        product_id=copernicus.PRIMARY_CURRENT_PRODUCT_ID,
+        dataset_id=copernicus.PRIMARY_CURRENT_STATIC_DATASET_ID,
+        variables=list(copernicus.PRIMARY_CURRENT_STATIC_VARIABLES),
+        bbox_wgs84=aoi_bbox_wgs84,
+        evidence_role=copernicus.PRIMARY_CURRENT_EVIDENCE_ROLE,
+    )
+    long_term_static_ds = _acquire_static_dataset(
+        manifest_path=manifest_path,
+        raw_dir=raw_dir / "statics",
+        product_id=copernicus.LONG_TERM_CURRENT_PRODUCT_ID,
+        dataset_id=copernicus.LONG_TERM_CURRENT_STATIC_DATASET_ID,
+        variables=["deptho"],
+        bbox_wgs84=aoi_bbox_wgs84,
+        evidence_role=copernicus.LONG_TERM_SURFACE_CURRENT_CONTEXT_ROLE,
+    )
+    wave_static_ds = _acquire_static_dataset(
+        manifest_path=manifest_path,
+        raw_dir=raw_dir / "statics",
+        product_id=copernicus.WAVE_PRODUCT_ID,
+        dataset_id=copernicus.WAVE_STATIC_DATASET_ID,
+        variables=list(copernicus.WAVE_STATIC_VARIABLES),
+        bbox_wgs84=aoi_bbox_wgs84,
+        evidence_role=copernicus.PRIMARY_WAVE_CLIMATE_ROLE,
+    )
+
+    # --- support-node identification and chainage mapping (Sections 4-5) -
+    primary_nodes = metocean_evidence.identify_wet_grid_cells(
+        primary_static_ds["longitude"].to_numpy(),
+        primary_static_ds["latitude"].to_numpy(),
+        _mask_surface_slice(primary_static_ds["mask"]).to_numpy(),
+        "current",
+    )
+    long_term_nodes = metocean_evidence.identify_wet_grid_cells(
+        long_term_static_ds["longitude"].to_numpy(),
+        long_term_static_ds["latitude"].to_numpy(),
+        np.isfinite(long_term_static_ds["deptho"].to_numpy()),
+        "current_lt",
+    )
+    wave_nodes = metocean_evidence.identify_wet_grid_cells(
+        wave_static_ds["longitude"].to_numpy(),
+        wave_static_ds["latitude"].to_numpy(),
+        _mask_surface_slice(wave_static_ds["mask"]).to_numpy(),
+        "wave",
+    )
+
+    primary_mapping = metocean_evidence.map_points_to_nearest_node(
+        chainage_points_working, primary_nodes, working_crs
+    )
+    long_term_mapping = metocean_evidence.map_points_to_nearest_node(
+        chainage_points_working, long_term_nodes, working_crs
+    )
+    wave_mapping = metocean_evidence.map_points_to_nearest_node(
+        chainage_points_working, wave_nodes, working_crs
+    )
+
+    primary_bathymetry_by_node = {
+        node.node_id: float(
+            primary_static_ds["deptho"].isel(latitude=node.grid_j, longitude=node.grid_i).to_numpy()
+        )
+        for node in primary_nodes
+        if node.node_id in set(primary_mapping["node_id"].dropna())
+    }
+    primary_deptho_lev_by_node = {
+        node.node_id: float(
+            primary_static_ds["deptho_lev"]
+            .isel(latitude=node.grid_j, longitude=node.grid_i)
+            .to_numpy()
+        )
+        for node in primary_nodes
+        if node.node_id in set(primary_mapping["node_id"].dropna())
+    }
+    wave_bathymetry_by_node = {
+        node.node_id: float(
+            wave_static_ds["deptho"].isel(latitude=node.grid_j, longitude=node.grid_i).to_numpy()
+        )
+        for node in wave_nodes
+        if node.node_id in set(wave_mapping["node_id"].dropna())
+    }
+
+    primary_node_table = metocean_evidence.build_support_node_table(
+        primary_nodes,
+        primary_mapping["node_id"],
+        primary_mapping["distance_m"],
+        model_bathymetry_by_node_id=primary_bathymetry_by_node,
+        deptho_lev_by_node_id=primary_deptho_lev_by_node,
+        source_product=copernicus.PRIMARY_CURRENT_PRODUCT_ID,
+        source_dataset=primary_current_dataset_id,
+        evidence_role=copernicus.PRIMARY_CURRENT_EVIDENCE_ROLE,
+    )
+
+    # --- primary current acquisition (Section 6, 15) ---------------------
+    primary_chunk_ranges = metocean_acquisition.generate_monthly_chunks(
+        # The rolling analysis/forecast catalogue's own available start is
+        # discovered live, never hard-coded (Section 6).
+        _dataset_start_or(
+            copernicus.get_dataset_time_range_ms(primary_current_dataset_id), now_utc
+        ),
+        historical_cutoff,
+    )
+    primary_current_ds = _acquire_chunked_dataset(
+        manifest_path=manifest_path,
+        raw_dir=raw_dir / "current_primary",
+        product_id=copernicus.PRIMARY_CURRENT_PRODUCT_ID,
+        dataset_id=primary_current_dataset_id,
+        variables=list(copernicus.PRIMARY_CURRENT_VARIABLES),
+        bbox_wgs84=aoi_bbox_wgs84,
+        depth_range=None,
+        chunk_ranges=primary_chunk_ranges,
+        evidence_role=copernicus.PRIMARY_CURRENT_EVIDENCE_ROLE,
+        temporal_resolution="hourly_instantaneous",
+    )
+
+    primary_current_df = pd.DataFrame()
+    if primary_current_ds is not None:
+        primary_current_df = metocean_evidence.normalize_primary_current(
+            primary_current_ds,
+            nodes=[n for n in primary_nodes if n.node_id in primary_bathymetry_by_node],
+            model_bathymetry_by_node_id=primary_bathymetry_by_node,
+            source_dataset=primary_current_dataset_id,
+            evidence_role=copernicus.PRIMARY_CURRENT_EVIDENCE_ROLE,
+        )
+
+    # --- long-term surface current acquisition (Sections 11, 31) ---------
+    long_term_start_ms = copernicus.get_dataset_time_range_ms(long_term_current_dataset_id)
+    long_term_chunk_ranges = metocean_acquisition.generate_yearly_chunks(
+        _dataset_start_or(long_term_start_ms, now_utc), historical_cutoff
+    )
+    long_term_current_ds = _acquire_chunked_dataset(
+        manifest_path=manifest_path,
+        raw_dir=raw_dir / "current_long_term_surface",
+        product_id=copernicus.LONG_TERM_CURRENT_PRODUCT_ID,
+        dataset_id=long_term_current_dataset_id,
+        variables=list(copernicus.LONG_TERM_CURRENT_VARIABLES),
+        bbox_wgs84=aoi_bbox_wgs84,
+        depth_range=None,
+        chunk_ranges=long_term_chunk_ranges,
+        evidence_role=copernicus.LONG_TERM_SURFACE_CURRENT_CONTEXT_ROLE,
+        temporal_resolution="hourly_instantaneous",
+    )
+
+    long_term_current_df = pd.DataFrame()
+    if long_term_current_ds is not None:
+        long_term_current_df = metocean_evidence.normalize_long_term_surface_current(
+            long_term_current_ds,
+            nodes=long_term_nodes,
+            source_dataset=long_term_current_dataset_id,
+            evidence_role=copernicus.LONG_TERM_SURFACE_CURRENT_CONTEXT_ROLE,
+        )
+
+    # --- wave reanalysis acquisition (Section 12) -------------------------
+    wave_start_ms = copernicus.get_dataset_time_range_ms(wave_dataset_id)
+    wave_chunk_ranges = metocean_acquisition.generate_yearly_chunks(
+        _dataset_start_or(wave_start_ms, now_utc), historical_cutoff
+    )
+    wave_ds = _acquire_chunked_dataset(
+        manifest_path=manifest_path,
+        raw_dir=raw_dir / "wave_reanalysis",
+        product_id=copernicus.WAVE_PRODUCT_ID,
+        dataset_id=wave_dataset_id,
+        variables=list(copernicus.WAVE_VARIABLES),
+        bbox_wgs84=aoi_bbox_wgs84,
+        depth_range=None,
+        chunk_ranges=wave_chunk_ranges,
+        evidence_role=copernicus.PRIMARY_WAVE_CLIMATE_ROLE,
+        temporal_resolution="3hourly_instantaneous",
+    )
+
+    wave_df = pd.DataFrame()
+    if wave_ds is not None:
+        wave_df = metocean_evidence.normalize_wave(
+            wave_ds, nodes=wave_nodes, source_dataset=wave_dataset_id
+        )
+
+    # --- descriptive statistics (Sections 24, 25, 27) ---------------------
+    current_stats = metocean_evidence.compute_current_node_statistics(primary_current_df)
+    long_term_stats = metocean_evidence.compute_long_term_surface_current_statistics(
+        long_term_current_df
+    )
+    wave_stats = metocean_evidence.compute_wave_node_statistics(wave_df)
+    annual_max_hs = metocean_evidence.compute_annual_max_hs(wave_df)
+
+    primary_start = primary_current_df["time_utc"].min() if not primary_current_df.empty else None
+    primary_end = primary_current_df["time_utc"].max() if not primary_current_df.empty else None
+    short_window_ratios = metocean_evidence.compute_short_window_surface_context_ratio(
+        long_term_current_df, primary_start, primary_end
+    )
+
+    long_term_node_table = metocean_evidence.build_support_node_table(
+        long_term_nodes,
+        long_term_mapping["node_id"],
+        long_term_mapping["distance_m"],
+        source_product=copernicus.LONG_TERM_CURRENT_PRODUCT_ID,
+        source_dataset=long_term_current_dataset_id,
+        evidence_role=copernicus.LONG_TERM_SURFACE_CURRENT_CONTEXT_ROLE,
+    )
+    wave_node_table = metocean_evidence.build_support_node_table(
+        wave_nodes,
+        wave_mapping["node_id"],
+        wave_mapping["distance_m"],
+        model_bathymetry_by_node_id=wave_bathymetry_by_node,
+        source_product=copernicus.WAVE_PRODUCT_ID,
+        source_dataset=wave_dataset_id,
+        evidence_role=copernicus.PRIMARY_WAVE_CLIMATE_ROLE,
+    )
+
+    # --- chainage evidence assembly (Section 23) --------------------------
+    chainage_metocean_df = metocean_evidence.build_chainage_metocean_evidence(
+        chainage_gdf=chainage_gdf,
+        canonical_depth_df=canonical_depth_df,
+        current_mapping=primary_mapping,
+        current_stats=current_stats,
+        current_node_bathymetry=primary_bathymetry_by_node,
+        long_term_mapping=long_term_mapping,
+        long_term_stats=long_term_stats,
+        wave_mapping=wave_mapping,
+        wave_stats=wave_stats,
+        wave_node_bathymetry=wave_bathymetry_by_node,
+    )
+
+    # --- write outputs -----------------------------------------------------
+    primary_nodes_path = metocean_evidence.write_parquet(
+        primary_node_table, metocean_interim_dir / "current_primary_support_nodes.parquet"
+    )
+    primary_current_path = metocean_evidence.write_parquet(
+        primary_current_df, metocean_interim_dir / "current_primary_hourly.parquet"
+    )
+    long_term_nodes_path = metocean_evidence.write_parquet(
+        long_term_node_table,
+        metocean_interim_dir / "current_long_term_surface_support_nodes.parquet",
+    )
+    long_term_current_path = metocean_evidence.write_parquet(
+        long_term_current_df, metocean_interim_dir / "current_long_term_surface_hourly.parquet"
+    )
+    wave_nodes_path = metocean_evidence.write_parquet(
+        wave_node_table, metocean_interim_dir / "wave_support_nodes.parquet"
+    )
+    wave_path = metocean_evidence.write_parquet(
+        wave_df, metocean_interim_dir / "wave_3hourly.parquet"
+    )
+    annual_max_hs_path = metocean_evidence.write_parquet(
+        annual_max_hs, metocean_interim_dir / "wave_annual_max_hs.parquet"
+    )
+    chainage_path = metocean_evidence.write_parquet(
+        chainage_metocean_df, metocean_processed_dir / "chainage_metocean_evidence.parquet"
+    )
+
+    metadata_path = metocean_processed_dir / "metocean_evidence_metadata.json"
+    metocean_evidence.write_metocean_evidence_metadata(
+        metadata={
+            "products": {
+                "primary_current": {
+                    "product_id": copernicus.PRIMARY_CURRENT_PRODUCT_ID,
+                    "dataset_id": primary_current_dataset_id,
+                    "static_dataset_id": copernicus.PRIMARY_CURRENT_STATIC_DATASET_ID,
+                    "evidence_role": copernicus.PRIMARY_CURRENT_EVIDENCE_ROLE,
+                    "temporal_resolution": "hourly_instantaneous",
+                    "vertical_semantics": (
+                        "deepest_valid_standard_level_current -- NOT native bottom-cell current"
+                    ),
+                },
+                "long_term_surface_current": {
+                    "product_id": copernicus.LONG_TERM_CURRENT_PRODUCT_ID,
+                    "dataset_id": long_term_current_dataset_id,
+                    "static_dataset_id": copernicus.LONG_TERM_CURRENT_STATIC_DATASET_ID,
+                    "evidence_role": copernicus.LONG_TERM_SURFACE_CURRENT_CONTEXT_ROLE,
+                    "temporal_resolution": "hourly_instantaneous",
+                    "forbidden_daily_dataset_id": (
+                        copernicus.LONG_TERM_CURRENT_FORBIDDEN_DAILY_DATASET_ID
+                    ),
+                },
+                "wave": {
+                    "product_id": copernicus.WAVE_PRODUCT_ID,
+                    "dataset_id": wave_dataset_id,
+                    "static_dataset_id": copernicus.WAVE_STATIC_DATASET_ID,
+                    "evidence_role": copernicus.PRIMARY_WAVE_CLIMATE_ROLE,
+                    "temporal_resolution": "3hourly_instantaneous",
+                },
+            },
+            "retrieval_timestamp": now_utc.isoformat(),
+            "historical_cutoff": historical_cutoff.isoformat(),
+            "current_direction_convention": "current_direction_to_deg: degrees clockwise from "
+            "true north, vector points TOWARD that bearing",
+            "wave_direction_convention": "wave_mean_direction_from_deg: degrees the waves "
+            "travel FROM; wave_mean_direction_to_deg = (from + 180) %% 360 is derived for "
+            "convenience only",
+            "support_node_mapping_method": "nearest wet model grid cell (no bilinear "
+            "interpolation of data or masks)",
+            "canonical_model_bathymetry_vertical_datums_not_harmonised": True,
+            "raw_acquisition_manifest_path": str(manifest_path),
+            "limitations": [
+                "primary current record is only the rolling available historical analysis "
+                "period, not a multi-decadal near-bed climatology",
+                "deepest valid standard level is not the model native bottom cell",
+                "long-term 7 km hourly current is surface current context only",
+                "wave data are model reanalysis, not local buoy observations",
+                "model bathymetry and canonical LAT bathymetry are not vertically harmonised",
+            ],
+            "no_physics_yet_statement": (
+                "This ticket produces forcing evidence only -- no bed shear stress, Shields "
+                "parameter, sediment mobility, erosion/deposition, scour, free-span, fatigue, "
+                "or risk scoring is computed anywhere here."
+            ),
+            "outputs": {
+                "current_primary_support_nodes": str(primary_nodes_path),
+                "current_primary_hourly": str(primary_current_path),
+                "current_long_term_surface_support_nodes": str(long_term_nodes_path),
+                "current_long_term_surface_hourly": str(long_term_current_path),
+                "wave_support_nodes": str(wave_nodes_path),
+                "wave_3hourly": str(wave_path),
+                "wave_annual_max_hs": str(annual_max_hs_path),
+                "chainage_metocean_evidence": str(chainage_path),
+            },
+        },
+        output_path=metadata_path,
+    )
+
+    print(f"Primary current support nodes: {len(primary_node_table)} -> {primary_nodes_path}")
+    print(f"Long-term current support nodes: {len(long_term_node_table)} -> {long_term_nodes_path}")
+    print(f"Wave support nodes: {len(wave_node_table)} -> {wave_nodes_path}")
+    print(f"Chainage metocean evidence: {len(chainage_metocean_df)} station(s) -> {chainage_path}")
+    print(f"Metadata: {metadata_path}")
+    print()
+    metocean_evidence.print_metocean_evidence_report(
+        primary_current_stats=current_stats,
+        long_term_stats=long_term_stats,
+        wave_stats=wave_stats,
+        short_window_ratios=short_window_ratios,
+        primary_current_actual_start=primary_start,
+        primary_current_actual_end=primary_end,
+        long_term_actual_start=long_term_current_df["time_utc"].min()
+        if not long_term_current_df.empty
+        else None,
+        long_term_actual_end=long_term_current_df["time_utc"].max()
+        if not long_term_current_df.empty
+        else None,
+        wave_actual_start=wave_df["time_utc"].min() if not wave_df.empty else None,
+        wave_actual_end=wave_df["time_utc"].max() if not wave_df.empty else None,
+    )
+    return 0
+
+
+def _dataset_start_or(time_range_ms: tuple | None, fallback_now: datetime) -> datetime:
+    """The live dataset's own start timestamp, or `fallback_now` if it could not be discovered."""
+
+    if time_range_ms is None:
+        return fallback_now
+    return datetime.fromtimestamp(time_range_ms[0] / 1000.0, tz=UTC)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="marine-engine",
@@ -902,6 +1491,19 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_sediment_evidence_parser.set_defaults(func=_cmd_build_sediment_evidence)
+
+    build_metocean_evidence_parser = subparsers.add_parser(
+        "build-metocean-evidence",
+        help=(
+            "Build the PL854 metocean forcing evidence base from Copernicus Marine: primary "
+            "1.5 km 3D hourly current, 7 km long-term surface current context, and wave "
+            "reanalysis -- forcing evidence only, no bed-shear physics."
+        ),
+    )
+    build_metocean_evidence_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_metocean_evidence_parser.set_defaults(func=_cmd_build_metocean_evidence)
 
     return parser
 

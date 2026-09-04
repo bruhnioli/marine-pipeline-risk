@@ -5,6 +5,7 @@ description = "Seabed-risk modelling engine for subsea pipeline corridors (resea
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "copernicusmarine>=2.1.1",
     "geopandas>=1.1.4",
     "pyarrow>=25.0.1",
     "pydantic>=2.13.5",
@@ -13,6 +14,7 @@ dependencies = [
     "rasterio>=1.5.1",
     "requests>=2.34.2",
     "scipy>=1.18.1",
+    "xarray>=2025.1.0",
 ]
 
 [project.scripts]
