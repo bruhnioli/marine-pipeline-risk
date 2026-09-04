@@ -25,6 +25,20 @@ covers every gravel/sand/mud fraction that is not negligible, and (when
 possible) that the bins' own total is consistent with the sample's stated
 `WEIGHT`.
 
+A third, separate correctness risk (MAR-008A): when `PHI_UNITS` is
+"percent", the populated bins are themselves supposed to already sum to
+~100% of the whole sample. A materially incomplete percentage distribution
+(e.g. bins summing to 80%) must never be silently renormalized to 100% by
+the cumulative-fraction math -- that would fabricate a whole-sample
+percentile out of a partial one. `derive_grain_percentiles` therefore
+validates the populated-bin total against 100% (within
+`PHI_PERCENT_TOTAL_TOLERANCE_PCT`, a data-QA heuristic, not a physical
+threshold) before deriving anything from a percent-unit distribution. This
+check is independent of, and additional to, the gravel/sand/mud coverage
+guard above: a percent distribution can sum to ~100% of just its own
+sub-fraction (e.g. the sand fraction alone) and still be rejected by the
+coverage guard for the same reason a mass distribution would be.
+
 D10/D50/D90 semantics
 ----------------------
 Following the standard geotechnical/sedimentology "percent finer" (percent
@@ -73,6 +87,13 @@ NEGLIGIBLE_FRACTION_PCT = 1.0
 # grams) to be trusted as whole-sample coverage rather than e.g. a
 # sand-fraction-only sieve breakdown.
 BIN_WEIGHT_TOTAL_RELATIVE_TOLERANCE = 0.05
+
+# Project heuristic for planning only, a data-QA check -- never a
+# physical/statistical threshold: how many percentage points a percent-unit
+# phi-bin total may deviate from 100% before the distribution is treated as
+# materially incomplete/excessive rather than trustworthy whole-sample
+# coverage (MAR-008A).
+PHI_PERCENT_TOTAL_TOLERANCE_PCT = 2.0
 
 _MIN_BINS_FOR_PERCENTILES = 3
 
@@ -286,6 +307,26 @@ def derive_grain_percentiles(
                 f"project heuristic: negligible threshold {NEGLIGIBLE_FRACTION_PCT}%); "
                 "computing a percentile from a partial fraction only would misrepresent "
                 "it as a whole-sample value.",
+                bin_count=len(sorted_phis),
+                total=total,
+            )
+
+    # Percent-unit bins must themselves sum to ~100% of the whole sample --
+    # never silently renormalized when materially incomplete/excessive
+    # (MAR-008A). Checked in addition to, not instead of, the coverage guard
+    # above: a sand-only percent distribution that happens to sum to ~100%
+    # of just the sand sub-fraction is still caught by that guard, not this
+    # one, when gravel/mud are materially present.
+    if is_percent:
+        percent_total_diff = abs(total - 100.0)
+        if percent_total_diff > PHI_PERCENT_TOTAL_TOLERANCE_PCT:
+            return _null(
+                INVALID_TOTAL,
+                f"Populated phi bins sum to {total:.2f}% (PHI_UNITS=percent), which is "
+                f"{percent_total_diff:.2f} percentage points from 100% -- exceeding the "
+                f"{PHI_PERCENT_TOTAL_TOLERANCE_PCT:g}-percentage-point project data-QA "
+                "tolerance for planning only (not a physical threshold); the bins likely "
+                "do not represent the whole sample and must not be silently renormalized.",
                 bin_count=len(sorted_phis),
                 total=total,
             )

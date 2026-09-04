@@ -235,3 +235,115 @@ def test_derive_grain_percentiles_invalid_total_when_bins_dont_match_weight():
     )
 
     assert result.status == grain_size.INVALID_TOTAL
+
+
+# --- derive_grain_percentiles: percent-unit whole-sample total validation (MAR-008A) --
+
+
+def test_derive_grain_percentiles_percent_total_exactly_100_is_valid():
+    result = grain_size.derive_grain_percentiles(
+        raw_properties=_five_equal_mass_bins(20.0),  # 5 x 20 = 100%
+        phi_units="percent",
+        gravel_pct=None,
+        sand_pct=None,
+        mud_pct=None,
+        gsm_units=None,
+        weight=None,
+        weight_units=None,
+    )
+
+    assert result.status == grain_size.DERIVED_FROM_PERCENT_BINS
+    assert result.d50_mm is not None
+    assert result.phi_total_before_normalization == pytest.approx(100.0)
+    assert result.normalized is True
+
+
+def test_derive_grain_percentiles_percent_total_within_tolerance_is_valid():
+    # 5 x 19.96 = 99.8% -- within PHI_PERCENT_TOTAL_TOLERANCE_PCT (2.0) of 100%.
+    result = grain_size.derive_grain_percentiles(
+        raw_properties=_five_equal_mass_bins(19.96),
+        phi_units="percent",
+        gravel_pct=None,
+        sand_pct=None,
+        mud_pct=None,
+        gsm_units=None,
+        weight=None,
+        weight_units=None,
+    )
+
+    assert result.status == grain_size.DERIVED_FROM_PERCENT_BINS
+    assert result.d50_mm is not None
+    # The ORIGINAL (not renormalized-to-100) total must remain recorded.
+    assert result.phi_total_before_normalization == pytest.approx(99.8)
+
+
+def test_derive_grain_percentiles_percent_total_incomplete_is_invalid():
+    # 5 x 16.0 = 80% -- materially incomplete, must never be silently
+    # renormalized to 100% and treated as a valid whole-sample distribution.
+    result = grain_size.derive_grain_percentiles(
+        raw_properties=_five_equal_mass_bins(16.0),
+        phi_units="percent",
+        gravel_pct=None,
+        sand_pct=None,
+        mud_pct=None,
+        gsm_units=None,
+        weight=None,
+        weight_units=None,
+    )
+
+    assert result.status == grain_size.INVALID_TOTAL
+    assert result.d10_mm is None
+    assert result.d50_mm is None
+    assert result.d90_mm is None
+    assert result.phi_total_before_normalization == pytest.approx(80.0)
+
+
+def test_derive_grain_percentiles_percent_total_excess_is_invalid():
+    # 5 x 24.0 = 120% -- materially excessive, same tolerance check applies
+    # symmetrically above 100%, not just below it.
+    result = grain_size.derive_grain_percentiles(
+        raw_properties=_five_equal_mass_bins(24.0),
+        phi_units="percent",
+        gravel_pct=None,
+        sand_pct=None,
+        mud_pct=None,
+        gsm_units=None,
+        weight=None,
+        weight_units=None,
+    )
+
+    assert result.status == grain_size.INVALID_TOTAL
+    assert result.d50_mm is None
+    assert result.phi_total_before_normalization == pytest.approx(120.0)
+
+
+def test_derive_grain_percentiles_percent_partial_fraction_trap_still_rejected():
+    """The coverage guard must still dominate even when the percent bins
+    themselves sum to exactly 100% -- of just the sand sub-fraction, not
+    the whole sample (gravel is materially present with zero gravel bins).
+
+    Same bins as the mass-unit partial-fraction-trap test above (they sum
+    to exactly 100), but reported as PHI_UNITS=percent this time -- proving
+    a "valid-looking" 100% percent total does not bypass the coverage guard.
+    """
+
+    raw_properties = {
+        "PHI_MI_0_5": 15.0,
+        "PHI_0_0": 25.0,
+        "PHI_0_5": 30.0,
+        "PHI_1_0": 30.0,
+    }
+
+    result = grain_size.derive_grain_percentiles(
+        raw_properties=raw_properties,
+        phi_units="percent",
+        gravel_pct=29.0,
+        sand_pct=70.0,
+        mud_pct=1.0,
+        gsm_units="percent",
+        weight=None,
+        weight_units=None,
+    )
+
+    assert result.status == grain_size.INSUFFICIENT_BINS
+    assert result.d50_mm is None

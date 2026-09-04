@@ -245,7 +245,13 @@ in with `uv run pytest -m live`.
      `SURFACE_GRAB`; sample years 1979-2009). Distance to the pipeline
      ranges 141-4986 m (median ~2928 m) -- proximity is always reported
      alongside the observation, never treated as proof the sample
-     represents seabed conditions at the pipe.
+     represents seabed conditions at the pipe. `surface_evidence_class`
+     (e.g. `SURFACE_GRAB`) is a vertical-position/sampling-relationship
+     classification at collection time only -- it does NOT establish that
+     an observation represents present-day seabed conditions merely
+     because it was taken at the seabed surface; a 1979 grab is still
+     `SURFACE_GRAB`, with its real age carried separately and explicitly in
+     `sample_date`/`sample_year`/`sample_age_years_at_run` (`MAR-008A`).
   2. **Mapped** -- BGS Seabed Sediments 250k (1:250,000 regional geological
      mapping, never site-specific ground truth): 8 polygons intersect the
      AOI, covering all 941 chainage stations (`mapped_250k_*` fields).
@@ -275,4 +281,39 @@ in with `uv run pytest -m live`.
   physical/statistical threshold). Only 34.1% of chainage stations have a
   surface PSA sample within 1000 m, and only 5 samples yield a usable D50;
   whether to build a continuous pipeline D50 field in a later ticket is
-  left to the external scientific reviewer. No further ticket has started.
+  left to the external scientific reviewer.
+- `MAR-008A`: external review found that `derive_grain_percentiles`
+  (`sediment/grain_size.py`) validated a percent-unit phi-bin total against
+  the sample's `WEIGHT` only for mass-unit (`grams`) bins -- a percent-unit
+  distribution's own populated-bin total was never checked against 100%,
+  so a materially incomplete distribution (e.g. bins summing to 80%) could
+  have been silently renormalized into a false whole-sample D10/D50/D90.
+  Fixed: a new `PHI_PERCENT_TOTAL_TOLERANCE_PCT` (2 percentage points, an
+  explicit project data-QA heuristic, never a physical threshold) gates
+  percent-unit bins -- a total outside `100% +/- 2pp` now returns
+  `INVALID_TOTAL` with null D10/D50/D90, while the original
+  (non-renormalized) total remains recorded in
+  `phi_total_before_normalization`. This check is additional to, not a
+  replacement for, the existing gravel/sand/mud whole-sample coverage guard
+  and the mass-bin/`WEIGHT` check, both of which are unchanged and continue
+  to dominate the partial-fraction case (a sand-only distribution that
+  itself sums to ~100% is still correctly rejected as `INSUFFICIENT_BINS`
+  before this new check would ever run).
+
+  Independently re-running `build-sediment-evidence` against the real
+  PL854 data confirms the previous 5 valid-D50 records (`65218674,
+  65222864, 65235166, 65243220, 65247338`) are unaffected and byte-for-byte
+  identical -- all 5 use `PHI_UNITS=grams`, not `percent`, so this fix
+  never touches them. Of PL854's 27 real PSA records, 6 use
+  `PHI_UNITS=percent`; all 6 already failed as `AMBIGUOUS_BIN_SCHEME` for
+  an unrelated, pre-existing reason (non-uniform phi-bin spacing) before
+  ever reaching the new total check, so the new validation had zero
+  observable effect on this specific dataset -- a genuinely verified
+  outcome, not one forced to preserve the prior count. D50 spatial support
+  assessment is unchanged: `VERY_SPARSE`. This ticket also corrected
+  wording in `sediment/evidence.py` and this README that could be read as
+  "surface evidence = present-day seabed sediment" -- `surface_evidence_class`
+  is a vertical-position/sampling-relationship classification at collection
+  time only (see the `MAR-008` bullet above); no age cutoff was introduced,
+  and real surface/subsurface classifications were not changed. No further
+  ticket has started.

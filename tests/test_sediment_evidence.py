@@ -240,6 +240,72 @@ def test_sample_date_independent_of_run_timestamp():
     assert gdf_2026.iloc[0]["sample_age_years_at_run"] == 21
 
 
+def test_old_grab_sample_is_still_surface_grab_with_age_carried_separately():
+    """MAR-008A: `surface_evidence_class` is a vertical-position/sampling-
+    relationship classification at collection time, never a claim about
+    present-day representativeness -- a 1979 grab sample is still
+    SURFACE_GRAB, exactly like a recent one, with its real age carried
+    only in sample_date/sample_year/sample_age_years_at_run. No age cutoff
+    downgrades an old grab to SUBSURFACE_INTERVAL/SURFACE_UNCERTAIN/etc.
+    """
+
+    route = _make_route()
+    aoi = _make_aoi(route)
+    old_point = Point(500100.0, 5900010.0)
+    recent_point = Point(500110.0, 5900010.0)
+
+    old_moment = datetime(1979, 8, 17, tzinfo=UTC)
+    recent_moment = datetime(2020, 3, 1, tzinfo=UTC)
+
+    old_feature = _feature_from_point_working(
+        old_point,
+        WORKING_CRS,
+        {
+            "PSA_DATA_ID": "OLD-1",
+            "EQUIPMENT_TYPE": "Grab: Shipek",
+            "DEPTH_TOP": 0,
+            "DEPTH_BASE": 0,
+            "EQUIPMENT_START_DATE": int(old_moment.timestamp() * 1000),
+        },
+    )
+    recent_feature = _feature_from_point_working(
+        recent_point,
+        WORKING_CRS,
+        {
+            "PSA_DATA_ID": "RECENT-1",
+            "EQUIPMENT_TYPE": "Grab: Shipek",
+            "DEPTH_TOP": 0,
+            "DEPTH_BASE": 0,
+            "EQUIPMENT_START_DATE": int(recent_moment.timestamp() * 1000),
+        },
+    )
+
+    gdf = evidence.normalize_psa_observations(
+        [old_feature, recent_feature],
+        route_working=route,
+        working_crs=WORKING_CRS,
+        aoi_geometry_working=aoi,
+        run_timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    old_row = gdf[gdf["psa_data_id"] == "OLD-1"].iloc[0]
+    recent_row = gdf[gdf["psa_data_id"] == "RECENT-1"].iloc[0]
+
+    # Identical classification regardless of age -- no age cutoff exists.
+    assert old_row["surface_evidence_class"] == evidence.SURFACE_GRAB
+    assert recent_row["surface_evidence_class"] == evidence.SURFACE_GRAB
+    assert old_row["surface_evidence_class"] == recent_row["surface_evidence_class"]
+    assert evidence.is_surface_evidence_class(old_row["surface_evidence_class"])
+
+    # Age/date remain explicit and correct -- never folded into the class,
+    # never described as "current"/"present-day" merely for being a grab.
+    assert old_row["sample_date"] == "1979-08-17"
+    assert old_row["sample_year"] == 1979
+    assert old_row["sample_age_years_at_run"] == 47
+    assert recent_row["sample_date"] == "2020-03-01"
+    assert recent_row["sample_age_years_at_run"] == 6
+
+
 # --- attach_mapped_and_predictive_at_psa_points -------------------------------
 
 

@@ -8,8 +8,15 @@ observation/station:
 - Tier 1 -- observed PSA (BGS "Offshore samples: particle size analysis"):
   primary observational evidence. Includes both genuine seabed surface
   grabs AND downhole/core subsamples -- `surface_evidence_class`
-  distinguishes them; only surface evidence should ever be read as
-  "present-day seabed sediment at this location".
+  distinguishes them, but it is a VERTICAL-POSITION/sampling-relationship
+  classification only (MAR-008A): it says where, relative to the seabed,
+  the sample was taken AT THE TIME OF COLLECTION (e.g. `SURFACE_GRAB` = a
+  seabed-surface grab observation at collection time), never how
+  temporally representative that observation is of present-day seabed
+  conditions. A `SURFACE_GRAB` from 1979 is still `SURFACE_GRAB` -- its age
+  is carried separately and explicitly in `sample_date`/`sample_year`/
+  `sample_age_years_at_run`, never folded into the classification and
+  never used to invent an age cutoff for it.
 - Tier 2 -- regional mapped substrate (BGS Seabed Sediments 250k): a
   1:250,000 regional geological mapping product, never site-specific
   ground truth. `mapped_250k_*` field names say "mapped", never
@@ -89,7 +96,15 @@ _PERCENT_UNIT_NAMES = ("percent", "%")
 def classify_surface_evidence(
     equipment_type: str | None, depth_top: float | None, depth_base: float | None
 ) -> str:
-    """Classify one PSA record's applicability as present-day surface evidence.
+    """Classify a PSA record's vertical position/sampling relationship to the seabed.
+
+    This describes where, relative to the seabed, the sample was taken AT
+    THE TIME OF COLLECTION (e.g. `SURFACE_GRAB` = a seabed-surface grab
+    observation at collection time) -- it is NOT a claim about how
+    temporally representative that observation is of present-day seabed
+    conditions (MAR-008A). Sample age/date is a separate, orthogonal fact
+    (`sample_date`/`sample_year`/`sample_age_years_at_run`); this function
+    never looks at them and never introduces an age cutoff.
 
     Uses only source fields (equipment type, depth top/base) -- never
     invents a depth or a real-world eligibility band. `depth_base` is
@@ -118,7 +133,12 @@ def classify_surface_evidence(
 
 
 def is_surface_evidence_class(value: Any) -> bool:
-    """True for the two classes eligible to represent present-day surface sediment."""
+    """True for the two classes taken at the seabed surface at collection time.
+
+    A vertical-position/sampling-relationship check only -- not a claim
+    that the observation represents present-day seabed conditions (see
+    `classify_surface_evidence`'s docstring).
+    """
 
     return value in (SURFACE_GRAB, SURFACE_CORE_INTERVAL)
 
@@ -1089,6 +1109,14 @@ def write_sediment_evidence_metadata(
         "tiers_never_blended": True,
         "surface_classification_logic": {
             "classes": list(SURFACE_EVIDENCE_CLASSES),
+            "semantics_note": (
+                "surface_evidence_class is a vertical-position/sampling-relationship "
+                "classification only: it says where, relative to the seabed, the sample "
+                "was taken AT THE TIME OF COLLECTION. It does NOT establish that the "
+                "observation represents present-day seabed conditions -- temporal "
+                "representativeness is a separate fact carried in sample_date/"
+                "sample_year/sample_age_years_at_run (MAR-008A)."
+            ),
             "rule": (
                 "DEPTH_TOP > tolerance -> SUBSURFACE_INTERVAL (always, regardless of "
                 "equipment). DEPTH_TOP ~= 0 (within a floating-point tolerance of "
