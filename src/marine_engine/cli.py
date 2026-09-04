@@ -260,7 +260,10 @@ def _cmd_fetch_bathymetry(args: argparse.Namespace) -> int:
             request_parameters=fetch_result.request_parameters,
             local_path=fetch_result.local_path,
             licence=emodnet.LICENCE,
-            acquisition_year=2024,
+            # EMODnet DTM 2024 is an aggregate product release, not a survey
+            # acquisition -- see acquisition.record_acquisition's docstring.
+            acquisition_year=None,
+            product_release_year=2024,
             horizontal_crs=fetch_result.returned_crs,
             vertical_datum=emodnet.VERTICAL_DATUM,
             nominal_resolution_m=emodnet.NATIVE_RESOLUTION_M,
@@ -547,7 +550,10 @@ def _cmd_build_regional_morphology(args: argparse.Namespace) -> int:
             request_parameters=fetch_result.request_parameters,
             local_path=fetch_result.local_path,
             licence=emodnet.LICENCE,
-            acquisition_year=2024,
+            # EMODnet DTM 2024 is an aggregate product release, not a survey
+            # acquisition -- see acquisition.record_acquisition's docstring.
+            acquisition_year=None,
+            product_release_year=2024,
             horizontal_crs=fetch_result.returned_crs,
             vertical_datum=emodnet.VERTICAL_DATUM,
             nominal_resolution_m=emodnet.NATIVE_RESOLUTION_M,

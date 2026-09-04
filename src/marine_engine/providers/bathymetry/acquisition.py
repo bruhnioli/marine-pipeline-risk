@@ -24,6 +24,7 @@ MANIFEST_ENTRY_FIELDS = (
     "sha256",
     "licence",
     "acquisition_year",
+    "product_release_year",
     "horizontal_crs",
     "vertical_datum",
     "nominal_resolution_m",
@@ -97,6 +98,7 @@ def record_acquisition(
     local_path: Path,
     licence: str | None,
     acquisition_year: int | None,
+    product_release_year: int | None,
     horizontal_crs: str | None,
     vertical_datum: str | None,
     nominal_resolution_m: float | None,
@@ -109,6 +111,19 @@ def record_acquisition(
     dataset_id (a different survey/epoch) always gets its own entry and,
     via `raw_dataset_dir`, its own file path -- never overwriting another
     epoch's file.
+
+    `acquisition_year` vs `product_release_year` (MAR-007A): the same
+    distinction already established on `SurveyRecord` (MAR-006B) applies
+    here, and these must never be used interchangeably.
+    `acquisition_year` is when the underlying observations/survey
+    measurements were physically acquired -- set it for a genuine survey
+    dataset, and leave it None for an aggregate/composite product.
+    `product_release_year` is the publication/release year of an
+    aggregate or derived product (e.g. EMODnet DTM 2024) -- set it for
+    such a product, and leave it None for a genuine survey unless a
+    distinct, explicitly-known product-release year is also relevant.
+    `acquisition_timestamp` is unrelated to either: it always means when
+    *this software* downloaded the file locally.
     """
 
     entry = {
@@ -123,6 +138,7 @@ def record_acquisition(
         "sha256": compute_sha256(local_path),
         "licence": licence,
         "acquisition_year": acquisition_year,
+        "product_release_year": product_release_year,
         "horizontal_crs": horizontal_crs,
         "vertical_datum": vertical_datum,
         "nominal_resolution_m": nominal_resolution_m,
@@ -136,3 +152,42 @@ def record_acquisition(
     entries.append(entry)
     save_manifest(manifest_path, entries)
     return entry
+
+
+def correct_temporal_metadata(
+    manifest_path: Path,
+    source: str,
+    dataset_id: str,
+    *,
+    acquisition_year: int | None,
+    product_release_year: int | None,
+) -> dict[str, Any]:
+    """Correct ONLY the temporal semantics of an existing manifest entry, in place.
+
+    A metadata-only correction, never a re-acquisition: `local_path`,
+    `sha256`, `file_size_bytes`, `request_parameters`,
+    `acquisition_timestamp`, and every other field are preserved exactly
+    as they were. Targets one specific, already-known (source, dataset_id)
+    pair -- it never scans the manifest for entries to "fix" by guessing
+    from an existing `acquisition_year` value, since that would risk
+    silently reclassifying a genuine survey that happens to share a year
+    with some aggregate product.
+
+    Raises `KeyError` if no matching entry exists yet -- there is nothing
+    to correct, and fabricating one here would defeat the whole point.
+    """
+
+    entries = load_manifest(manifest_path)
+    for index, entry in enumerate(entries):
+        if entry.get("source") == source and entry.get("dataset_id") == dataset_id:
+            corrected = dict(entry)
+            corrected["acquisition_year"] = acquisition_year
+            corrected["product_release_year"] = product_release_year
+            entries[index] = corrected
+            save_manifest(manifest_path, entries)
+            return corrected
+
+    raise KeyError(
+        f"No manifest entry found for source={source!r} dataset_id={dataset_id!r} at "
+        f"{manifest_path}; nothing to correct."
+    )
