@@ -73,6 +73,22 @@ class ChainageStation:
 
 
 @dataclass(frozen=True)
+class RouteProjection:
+    """An arbitrary point's projection onto the route: where, how far, how close.
+
+    `distance_m` is the perpendicular offset from `point` to `nearest_point`
+    -- it is never proof that whatever `point` observed (e.g. a sediment
+    sample) is representative of conditions at the pipeline; callers must
+    keep it visible rather than collapsing it into a boolean or score.
+    """
+
+    chainage_m: float
+    nearest_point: Point
+    distance_m: float
+    fraction_along_route: float
+
+
+@dataclass(frozen=True)
 class ChainageStations:
     """The full generated station sequence plus derived counts."""
 
@@ -277,6 +293,29 @@ def compute_chainage_stations(
         regular_station_count=n_regular,
         terminal_residual_m=terminal_residual_m,
         total_length_m=total_length_m,
+    )
+
+
+def project_point_to_route(route: LineString, point: Point) -> RouteProjection:
+    """Project an arbitrary point onto the route (nearest point, chainage, distance).
+
+    Uses `LineString.project`/`.interpolate` (arc-length linear referencing)
+    rather than the 941 pre-built chainage stations, so it works for any
+    point -- e.g. a sediment sample -- not just station locations. Never
+    implies the point's own observation applies AT the pipeline: `distance_m`
+    is always reported alongside the projection, never discarded.
+    """
+
+    chainage_m = route.project(point)
+    nearest_point = route.interpolate(chainage_m)
+    distance_m = point.distance(nearest_point)
+    fraction_along_route = chainage_m / route.length if route.length > 0 else 0.0
+
+    return RouteProjection(
+        chainage_m=chainage_m,
+        nearest_point=nearest_point,
+        distance_m=distance_m,
+        fraction_along_route=fraction_along_route,
     )
 
 

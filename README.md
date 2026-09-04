@@ -43,8 +43,9 @@ entry point over that config system.
 Beyond the NSTA provider (MAR-002), AOI/chainage preprocessing
 (MAR-003/004), bathymetry source discovery (MAR-005), the canonical
 EMODnet baseline DTM (MAR-006), CDI source-survey resolution (MAR-006B),
-and broad regional seabed morphology (MAR-007), the stage packages contain
-no algorithms yet — see "Status" below.
+broad regional seabed morphology (MAR-007), and the PL854 sediment
+evidence base (MAR-008), the stage packages contain no algorithms yet —
+see "Status" below.
 
 ## Project layout
 
@@ -75,12 +76,13 @@ uv run marine-engine fetch-bathymetry configs/pl854.yaml
 uv run marine-engine build-bathymetry configs/pl854.yaml
 uv run marine-engine resolve-bathymetry-sources configs/pl854.yaml
 uv run marine-engine build-regional-morphology configs/pl854.yaml
+uv run marine-engine build-sediment-evidence configs/pl854.yaml
 ```
 
 `ingest-pipeline`, `discover-bathymetry`, `fetch-bathymetry`,
-`build-bathymetry`, `resolve-bathymetry-sources`, and
-`build-regional-morphology` require network access to public services
-(NSTA, MEDIN, BGS GeoNetwork, EMODnet, SeaDataNet CDI).
+`build-bathymetry`, `resolve-bathymetry-sources`, `build-regional-morphology`,
+and `build-sediment-evidence` require network access to public services
+(NSTA, MEDIN, BGS GeoNetwork/ArcGIS REST, EMODnet, SeaDataNet CDI).
 Their live-source smoke tests are excluded from the default test run; opt
 in with `uv run pytest -m live`.
 
@@ -232,4 +234,45 @@ in with `uv run pytest -m live`.
   checked live and found unavailable as a small/queryable coverage for
   this release (only a whole-tile, non-AOI-clipped "SD" archive exists);
   the corresponding chainage fields are recorded as null rather than
-  fabricated. No further ticket has started.
+  fabricated.
+- `MAR-008`: PL854 seabed sediment/substrate evidence base
+  (`providers/sediment/bgs.py`, `sediment/{evidence,grain_size}.py`) from
+  three separate, never-blended BGS evidence tiers, each queried spatially
+  against the real AOI polygon (not a bounding box or text match):
+
+  1. **Observed** -- BGS "Offshore samples: particle size analysis": 27
+     real point samples intersect the PL854 AOI (all confirmed
+     `SURFACE_GRAB`; sample years 1979-2009). Distance to the pipeline
+     ranges 141-4986 m (median ~2928 m) -- proximity is always reported
+     alongside the observation, never treated as proof the sample
+     represents seabed conditions at the pipe.
+  2. **Mapped** -- BGS Seabed Sediments 250k (1:250,000 regional geological
+     mapping, never site-specific ground truth): 8 polygons intersect the
+     AOI, covering all 941 chainage stations (`mapped_250k_*` fields).
+  3. **Predictive** -- BGS Predictive Seabed Sediments UK (Distributional
+     Random Forest, ~38,000 training observations, covariates including
+     bathymetry/morphometry/currents/tides): `evidence_role =
+     SECONDARY_MODEL_COMPARISON` always, with an explicit
+     `circularity_warning` on every predictive-field record -- never
+     treated as ground truth, never blended with the observed or mapped
+     tiers, never used to fill a missing observed value.
+
+  Grain-size percentiles (D10/D50/D90) are derived only from a PSA
+  record's own internally consistent, non-overlapping phi bins (never from
+  Folk class, GSM percentages, or the predictive product); of the 27
+  observed samples, 5 have a valid whole-sample D10/D50/D90 (D50 range
+  0.21-0.38 mm, pure/near-pure sand), 6 are `AMBIGUOUS_BIN_SCHEME`, and 16
+  are `INSUFFICIENT_BINS` -- most of those because their phi-bin breakdown
+  covers only the sand fraction while gravel is materially present (a real
+  correctness guard, not conservatism for its own sake: computing a
+  whole-sample D50 from a partial-fraction breakdown would misrepresent
+  it). No sediment mobility, Shields parameter, critical shear stress,
+  bedload/suspended transport, erosion/deposition, or cohesive/noncohesive
+  classification is computed anywhere in this ticket.
+
+  **D50 spatial support assessment: `VERY_SPARSE`** (descriptive only, an
+  explicit project heuristic for planning purposes -- never a
+  physical/statistical threshold). Only 34.1% of chainage stations have a
+  surface PSA sample within 1000 m, and only 5 samples yield a usable D50;
+  whether to build a continuous pipeline D50 field in a later ticket is
+  left to the external scientific reviewer. No further ticket has started.

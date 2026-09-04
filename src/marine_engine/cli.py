@@ -23,6 +23,7 @@ from marine_engine.preprocessing.chainage import (
     ChainageValidationError,
     InvalidPipelineRouteError,
     build_chainage,
+    load_pipeline_route,
     print_chainage_report,
 )
 from marine_engine.providers.bathymetry import acquisition, bgs, emodnet, inventory, ukho
@@ -33,6 +34,8 @@ from marine_engine.providers.nsta import (
     ingest_pipeline,
     print_ingestion_report,
 )
+from marine_engine.providers.sediment import bgs as sediment_bgs
+from marine_engine.sediment import evidence
 
 
 def _cmd_version(_args: argparse.Namespace) -> int:
@@ -613,6 +616,188 @@ def _cmd_build_regional_morphology(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_sediment_evidence(args: argparse.Namespace) -> int:
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    pipeline_gpkg_path, aoi_gpkg_path, chainage_gpkg_path, interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    if not aoi_gpkg_path.exists() or not chainage_gpkg_path.exists():
+        print(
+            f"error: no canonical AOI/chainage found under {aoi_gpkg_path.parent}; "
+            "run build-aoi and build-chainage first",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        route_working, _attributes, _source_crs = load_pipeline_route(
+            pipeline_gpkg_path, pipeline_id
+        )
+        aoi_gdf = gpd.read_file(aoi_gpkg_path, layer="study_aoi")
+        chainage_gdf = gpd.read_file(chainage_gpkg_path, layer="chainage_points")
+    except Exception as exc:  # noqa: BLE001 -- one clear message regardless of the underlying cause
+        print(f"error: could not load canonical pipeline/AOI/chainage: {exc}", file=sys.stderr)
+        return 1
+
+    working_crs = config.crs.horizontal
+    aoi_geometry_working = unary_union(aoi_gdf.geometry)
+    aoi_geometry_wgs84 = (
+        gpd.GeoSeries([aoi_geometry_working], crs=working_crs).to_crs("EPSG:4326").iloc[0]
+    )
+    query_timestamp = datetime.now(UTC)
+
+    try:
+        psa_features = sediment_bgs.fetch_psa_observations(aoi_geometry_wgs84)
+        seabed_250k_features = sediment_bgs.fetch_seabed_sediments_250k(aoi_geometry_wgs84)
+        predictive_folk_features = sediment_bgs.fetch_predictive_folk_polygons(aoi_geometry_wgs84)
+    except sediment_bgs.BgsSedimentUnavailableError as exc:
+        print(f"error: BGS sediment acquisition failed: {exc}", file=sys.stderr)
+        return 1
+
+    psa_gdf = evidence.normalize_psa_observations(
+        psa_features,
+        route_working=route_working,
+        working_crs=working_crs,
+        aoi_geometry_working=aoi_geometry_working,
+        run_timestamp=query_timestamp,
+    )
+    psa_gdf = evidence.attach_nearest_chainage_station(psa_gdf, chainage_gdf.to_crs(working_crs))
+
+    seabed_250k_gdf = evidence.normalize_seabed_sediments_250k(
+        seabed_250k_features, working_crs=working_crs
+    )
+    seabed_250k_gdf = evidence.compute_250k_intersections(
+        seabed_250k_gdf, aoi_geometry_working=aoi_geometry_working, route_working=route_working
+    )
+
+    predictive_folk_gdf = evidence.normalize_predictive_folk_polygons(
+        predictive_folk_features, working_crs=working_crs
+    )
+
+    psa_with_comparisons = evidence.attach_mapped_and_predictive_at_psa_points(
+        psa_gdf, seabed_250k_gdf, predictive_folk_gdf
+    )
+
+    # Predictive sand/gravel/mud percentages: only at surface PSA points, never
+    # at all 941 chainage stations -- see the metadata's
+    # predictive_percentage_chainage_note for why (Section 16's own
+    # "if not safely queryable, do not fabricate").
+    surface_mask = psa_with_comparisons["surface_evidence_class"].isin(
+        (evidence.SURFACE_GRAB, evidence.SURFACE_CORE_INTERVAL)
+    )
+    predictive_percentages_by_psa_id: dict = {}
+    for _, row in psa_with_comparisons[surface_mask].iterrows():
+        percentages = {}
+        for key, layer_id in (
+            ("gravel", sediment_bgs.PREDICTIVE_GRAVEL_LAYER_ID),
+            ("sand", sediment_bgs.PREDICTIVE_SAND_LAYER_ID),
+            ("mud", sediment_bgs.PREDICTIVE_MUD_LAYER_ID),
+        ):
+            try:
+                percentages[key] = sediment_bgs.fetch_predictive_percentage_at_point(
+                    row["longitude"], row["latitude"], layer_id
+                )
+            except sediment_bgs.BgsSedimentUnavailableError:
+                percentages[key] = None
+        predictive_percentages_by_psa_id[row["psa_data_id"]] = percentages
+
+    predictive_comparison_df = evidence.build_predictive_comparison_table(
+        psa_with_comparisons, predictive_percentages_by_psa_id=predictive_percentages_by_psa_id
+    )
+
+    chainage_sediment_df = evidence.build_chainage_sediment_evidence(
+        chainage_gdf=chainage_gdf,
+        psa_gdf_working=psa_with_comparisons,
+        seabed_250k_gdf_working=seabed_250k_gdf,
+        predictive_folk_gdf_working=predictive_folk_gdf,
+        working_crs=working_crs,
+    )
+
+    coverage = evidence.compute_coverage_diagnostics(psa_gdf)
+    chainage_support = evidence.compute_chainage_support_proportions(chainage_sediment_df)
+    agreement = evidence.compute_agreement_diagnostics(psa_with_comparisons, chainage_sediment_df)
+    d50_assessment = evidence.assess_d50_spatial_support(chainage_sediment_df, coverage)
+
+    sediment_interim_dir = interim_dir / "sediment"
+    sediment_processed_dir = config.paths.processed_dir / pipeline_id.lower() / "sediment"
+
+    psa_parquet_path = sediment_interim_dir / "bgs_psa_observations.parquet"
+    psa_gpkg_path = sediment_interim_dir / "bgs_psa_observations.gpkg"
+    seabed_250k_gpkg_path = sediment_interim_dir / "bgs_seabed_sediments_250k.gpkg"
+    seabed_250k_parquet_path = sediment_interim_dir / "bgs_seabed_sediments_250k.parquet"
+    predictive_comparison_path = sediment_interim_dir / "bgs_predictive_sediment_comparison.parquet"
+    chainage_sediment_path = sediment_processed_dir / "chainage_sediment_evidence.parquet"
+    metadata_path = sediment_processed_dir / "sediment_evidence_metadata.json"
+
+    evidence.write_psa_observations(psa_gdf, psa_parquet_path, psa_gpkg_path)
+    evidence.write_seabed_sediments_250k(
+        seabed_250k_gdf, seabed_250k_gpkg_path, seabed_250k_parquet_path
+    )
+    evidence.write_predictive_comparison(predictive_comparison_df, predictive_comparison_path)
+    evidence.write_chainage_sediment_evidence(chainage_sediment_df, chainage_sediment_path)
+
+    providers_metadata = {
+        "bgs_psa": {
+            "provider": "BGS",
+            "dataset": sediment_bgs.PSA_DATASET_TITLE,
+            "endpoint": sediment_bgs.PSA_SERVICE_URL,
+            "evidence_role": "PRIMARY_OBSERVATIONAL",
+        },
+        "bgs_seabed_sediments_250k": {
+            "provider": "BGS",
+            "dataset": sediment_bgs.SEABED_SEDIMENTS_250K_DATASET_TITLE,
+            "endpoint": sediment_bgs.SEABED_SEDIMENTS_250K_SERVICE_URL,
+            "evidence_role": "REGIONAL_MAPPED_SUBSTRATE",
+        },
+        "bgs_predictive": {
+            "provider": "BGS",
+            "dataset": sediment_bgs.PREDICTIVE_DATASET_TITLE,
+            "endpoint": sediment_bgs.PREDICTIVE_FOLK_SERVICE_URL,
+            "percentage_layers_endpoint": sediment_bgs.PREDICTIVE_SERVICE_ROOT_URL,
+            "evidence_role": "SECONDARY_MODEL_COMPARISON",
+        },
+    }
+    evidence.write_sediment_evidence_metadata(
+        providers=providers_metadata,
+        query_timestamp=query_timestamp,
+        aoi_identifier=f"{pipeline_id}_AOI",
+        coverage=coverage,
+        chainage_support=chainage_support,
+        agreement=agreement,
+        d50_assessment=d50_assessment,
+        outputs={
+            "psa_observations_parquet": psa_parquet_path,
+            "psa_observations_gpkg": psa_gpkg_path,
+            "seabed_sediments_250k_gpkg": seabed_250k_gpkg_path,
+            "seabed_sediments_250k_parquet": seabed_250k_parquet_path,
+            "predictive_comparison_parquet": predictive_comparison_path,
+            "chainage_sediment_evidence_parquet": chainage_sediment_path,
+        },
+        output_path=metadata_path,
+    )
+
+    print(f"PSA observations: {len(psa_gdf)} record(s) -> {psa_parquet_path}")
+    print(f"Seabed Sediments 250k: {len(seabed_250k_gdf)} polygon(s) -> {seabed_250k_gpkg_path}")
+    print(f"Predictive comparison: {len(predictive_comparison_df)} row(s)")
+    print(f"  -> {predictive_comparison_path}")
+    print(f"Chainage sediment evidence: {len(chainage_sediment_df)} station(s)")
+    print(f"  -> {chainage_sediment_path}")
+    print(f"Metadata: {metadata_path}")
+    print()
+    evidence.print_sediment_evidence_report(
+        coverage=coverage,
+        chainage_support=chainage_support,
+        agreement=agreement,
+        d50_assessment=d50_assessment,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="marine-engine",
@@ -704,6 +889,19 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_morphology_parser.set_defaults(func=_cmd_build_regional_morphology)
+
+    build_sediment_evidence_parser = subparsers.add_parser(
+        "build-sediment-evidence",
+        help=(
+            "Build the PL854 seabed sediment/substrate evidence base from BGS PSA "
+            "observations, BGS Seabed Sediments 250k, and the BGS predictive product "
+            "(comparison only) -- no sediment mobility physics."
+        ),
+    )
+    build_sediment_evidence_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_sediment_evidence_parser.set_defaults(func=_cmd_build_sediment_evidence)
 
     return parser
 

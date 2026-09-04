@@ -803,3 +803,124 @@ def test_build_regional_morphology_command_success(
     out = capsys.readouterr().out
     assert exit_code == 0
     assert "morphology raster" in out
+
+
+def test_build_sediment_evidence_command_requires_pipeline_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "no_pipeline.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-sediment-evidence", str(config_path)])
+
+    assert exit_code == 1
+    assert "pipeline.pipeline_id" in capsys.readouterr().err
+
+
+def test_build_sediment_evidence_command_requires_aoi_and_chainage(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_minimal_study_config(tmp_path)
+
+    exit_code = main(["build-sediment-evidence", str(config_path)])
+
+    assert exit_code == 1
+    assert "build-aoi and build-chainage first" in capsys.readouterr().err
+
+
+def _write_sediment_evidence_fixture(tmp_path: Path) -> Path:
+    """A minimal on-disk study: config + pipeline + AOI + chainage (2 stations)."""
+
+    processed_dir = tmp_path / "processed"
+    interim_dir = tmp_path / "interim"
+    config_path = tmp_path / "study.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n"
+        f"paths:\n  processed_dir: {processed_dir}\n  interim_dir: {interim_dir}\n"
+        "pipeline:\n  pipeline_id: PL854\n",
+        encoding="utf-8",
+    )
+
+    study_dir = processed_dir / "pl854"
+    study_dir.mkdir(parents=True, exist_ok=True)
+
+    route = LineString([(500000.0, 5900000.0), (500100.0, 5900000.0)])
+    pipeline_gdf = gpd.GeoDataFrame(
+        [{"pipeline_id": "PL854", "source": "test", "status": "ACTIVE"}],
+        geometry=[route],
+        crs="EPSG:32631",
+    )
+    pipeline_gdf.to_file(study_dir / "pipeline.gpkg", driver="GPKG", layer="pipeline")
+
+    aoi_gdf = gpd.GeoDataFrame(
+        [{"study_id": "PL854"}], geometry=[route.buffer(50.0)], crs="EPSG:32631"
+    )
+    aoi_gdf.to_file(study_dir / "aoi.gpkg", driver="GPKG", layer="study_aoi")
+
+    chainage_gdf = gpd.GeoDataFrame(
+        [
+            {"pipeline_id": "PL854", "station_index": 0, "chainage_m": 0.0, "kp_label": "KP 0+000"},
+            {
+                "pipeline_id": "PL854",
+                "station_index": 1,
+                "chainage_m": 100.0,
+                "kp_label": "KP 0+100",
+            },
+        ],
+        geometry=[Point(500000.0, 5900000.0), Point(500100.0, 5900000.0)],
+        crs="EPSG:32631",
+    )
+    chainage_gdf.to_file(study_dir / "chainage_25m.gpkg", driver="GPKG", layer="chainage_points")
+
+    return config_path
+
+
+def test_build_sediment_evidence_command_success_with_no_records(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from marine_engine.providers.sediment import bgs as sediment_bgs
+
+    config_path = _write_sediment_evidence_fixture(tmp_path)
+
+    monkeypatch.setattr(sediment_bgs, "fetch_psa_observations", lambda *a, **k: [])
+    monkeypatch.setattr(sediment_bgs, "fetch_seabed_sediments_250k", lambda *a, **k: [])
+    monkeypatch.setattr(sediment_bgs, "fetch_predictive_folk_polygons", lambda *a, **k: [])
+
+    exit_code = main(["build-sediment-evidence", str(config_path)])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "PSA observations: 0 record(s)" in out
+    assert "D50 SPATIAL SUPPORT ASSESSMENT" in out
+    assert "NOT_ASSESSABLE" in out
+
+    interim_dir = tmp_path / "interim" / "pl854" / "sediment"
+    processed_dir = tmp_path / "processed" / "pl854" / "sediment"
+    assert (interim_dir / "bgs_psa_observations.parquet").exists()
+    assert (interim_dir / "bgs_seabed_sediments_250k.gpkg").exists()
+    assert (processed_dir / "chainage_sediment_evidence.parquet").exists()
+    assert (processed_dir / "sediment_evidence_metadata.json").exists()
+
+    chainage_df = pd.read_parquet(processed_dir / "chainage_sediment_evidence.parquet")
+    assert len(chainage_df) == 2  # both synthetic chainage stations retained regardless of match
+
+
+def test_build_sediment_evidence_command_reports_bgs_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from marine_engine.providers.sediment import bgs as sediment_bgs
+
+    config_path = _write_sediment_evidence_fixture(tmp_path)
+
+    def raise_unavailable(*a, **k):
+        raise sediment_bgs.BgsSedimentUnavailableError("simulated BGS outage")
+
+    monkeypatch.setattr(sediment_bgs, "fetch_psa_observations", raise_unavailable)
+
+    exit_code = main(["build-sediment-evidence", str(config_path)])
+
+    assert exit_code == 1
+    assert "simulated BGS outage" in capsys.readouterr().err

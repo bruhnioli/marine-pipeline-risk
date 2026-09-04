@@ -122,6 +122,48 @@ def test_deterministic_repeated_computation():
     ]
 
 
+# --- project_point_to_route (pure) -------------------------------------------
+
+
+def test_project_point_to_route_point_on_route():
+    route = LineString([(0, 0), (100, 0)])
+    projection = chainage.project_point_to_route(route, Point(40, 0))
+
+    assert projection.chainage_m == pytest.approx(40.0)
+    assert projection.distance_m == pytest.approx(0.0, abs=1e-9)
+    assert projection.nearest_point.x == pytest.approx(40.0)
+    assert projection.nearest_point.y == pytest.approx(0.0)
+    assert projection.fraction_along_route == pytest.approx(0.4)
+
+
+def test_project_point_to_route_point_off_route():
+    route = LineString([(0, 0), (100, 0)])
+    projection = chainage.project_point_to_route(route, Point(30, 40))  # 40 m abeam chainage 30
+
+    assert projection.chainage_m == pytest.approx(30.0)
+    assert projection.distance_m == pytest.approx(40.0)
+    assert projection.nearest_point.x == pytest.approx(30.0)
+    assert projection.nearest_point.y == pytest.approx(0.0)
+
+
+def test_project_point_to_route_beyond_route_end_clamps_to_terminus():
+    route = LineString([(0, 0), (100, 0)])
+    projection = chainage.project_point_to_route(route, Point(150, 0))
+
+    assert projection.chainage_m == pytest.approx(100.0)
+    assert projection.distance_m == pytest.approx(50.0)
+
+
+def test_project_point_to_route_never_reports_distance_zero_from_offset():
+    """`distance_m` must always stay visible -- never collapsed away by a caller."""
+
+    route = LineString([(0, 0), (200, 0)])
+    projection = chainage.project_point_to_route(route, Point(100, 5))
+
+    assert projection.distance_m == pytest.approx(5.0)
+    assert projection.chainage_m == pytest.approx(100.0)
+
+
 # --- KP label formatting ------------------------------------------------------
 
 
