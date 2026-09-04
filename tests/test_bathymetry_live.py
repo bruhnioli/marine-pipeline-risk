@@ -63,6 +63,14 @@ def test_emodnet_msl_availability_check_is_reachable():
     assert result.notes
 
 
+def test_emodnet_native_qa_layer_discovery_is_reachable():
+    result = emodnet.check_native_qa_layers(PL854_AOI_BBOX_WGS84)
+
+    assert len(result.wcs_coverage_ids) > 0
+    assert "emodnet__mean" in result.wcs_coverage_ids
+    assert result.notes
+
+
 def test_cdi_report_host_bot_challenge_still_blocks_plain_http(tmp_path):
     """Documents current real-world behaviour, not a hard requirement.
 

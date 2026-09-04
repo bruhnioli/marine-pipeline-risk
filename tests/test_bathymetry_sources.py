@@ -19,6 +19,10 @@ class FakeResponse:
         self.headers = headers or {}
         self.status_code = status_code
 
+    @property
+    def text(self) -> str:
+        return self.content.decode("utf-8")
+
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             raise requests.HTTPError(f"HTTP {self.status_code}")
@@ -610,3 +614,93 @@ def test_check_msl_availability_network_failure_returns_result_not_exception(mon
 
     assert result.available is False
     assert "simulated network failure" in result.notes
+
+
+# --- EMODnet: native per-cell QA layer discovery (MAR-007) -------------------
+
+WCS_CAPABILITIES_XML_REAL_SHAPED = b"""<?xml version="1.0" encoding="UTF-8"?>
+<wcs:Capabilities xmlns:wcs="http://www.opengis.net/wcs/2.0">
+  <wcs:Contents>
+    <wcs:CoverageSummary><wcs:CoverageId>emodnet__mean</wcs:CoverageId></wcs:CoverageSummary>
+    <wcs:CoverageSummary><wcs:CoverageId>emodnet__mean_2022</wcs:CoverageId></wcs:CoverageSummary>
+    <wcs:CoverageSummary><wcs:CoverageId>emodnet__mean_atlas_land</wcs:CoverageId></wcs:CoverageSummary>
+  </wcs:Contents>
+</wcs:Capabilities>"""
+
+
+def test_list_wcs_coverage_ids_parses_real_shaped_response(monkeypatch):
+    def fake_get(url, params=None, timeout=None):
+        return FakeResponse(WCS_CAPABILITIES_XML_REAL_SHAPED)
+
+    monkeypatch.setattr(emodnet.requests, "get", fake_get)
+
+    coverage_ids = emodnet.list_wcs_coverage_ids()
+
+    assert coverage_ids == ["emodnet__mean", "emodnet__mean_2022", "emodnet__mean_atlas_land"]
+
+
+def test_check_native_qa_layers_finds_no_wcs_match_when_none_advertised(monkeypatch):
+    def fake_get(url, params=None, timeout=None):
+        return FakeResponse(WCS_CAPABILITIES_XML_REAL_SHAPED)
+
+    monkeypatch.setattr(emodnet.requests, "get", fake_get)
+    monkeypatch.setattr(emodnet, "_wfs_get_feature", lambda *a, **k: {"features": []})
+
+    result = emodnet.check_native_qa_layers((1.0, 53.0, 2.0, 54.0))
+
+    assert all(match is None for match in result.wcs_matches.values())
+
+
+def test_check_native_qa_layers_finds_sd_download_tile_match(monkeypatch):
+    def fake_get(url, params=None, timeout=None):
+        return FakeResponse(WCS_CAPABILITIES_XML_REAL_SHAPED)
+
+    monkeypatch.setattr(emodnet.requests, "get", fake_get)
+
+    def fake_wfs_get_feature(type_name, bbox, **kwargs):
+        return {
+            "features": [
+                {"properties": {"dtm_release": "2024", "product_format": "SD"}},
+                {"properties": {"dtm_release": "2024", "product_format": "ESRI ASCII"}},
+                {"properties": {"dtm_release": "2024", "product_format": "NetCDF"}},
+            ]
+        }
+
+    monkeypatch.setattr(emodnet, "_wfs_get_feature", fake_wfs_get_feature)
+
+    result = emodnet.check_native_qa_layers((1.0, 53.0, 2.0, 54.0))
+
+    assert result.download_tile_matches["depth_std"] == "SD"
+    assert result.download_tile_matches["minimum_depth"] is None
+    assert result.download_tile_matches["n_values"] is None
+    assert result.download_tile_matches["interpolation_flag"] is None
+
+
+def test_check_native_qa_layers_handles_wcs_failure_gracefully(monkeypatch):
+    def fake_get(url, params=None, timeout=None):
+        raise requests.ConnectionError("simulated network failure")
+
+    monkeypatch.setattr(emodnet.requests, "get", fake_get)
+    monkeypatch.setattr(emodnet, "_wfs_get_feature", lambda *a, **k: {"features": []})
+
+    result = emodnet.check_native_qa_layers((1.0, 53.0, 2.0, 54.0))
+
+    assert result.wcs_coverage_ids == ()
+    assert all(match is None for match in result.wcs_matches.values())
+
+
+def test_check_native_qa_layers_handles_download_tiles_failure_gracefully(monkeypatch):
+    def fake_get(url, params=None, timeout=None):
+        return FakeResponse(WCS_CAPABILITIES_XML_REAL_SHAPED)
+
+    monkeypatch.setattr(emodnet.requests, "get", fake_get)
+
+    def raise_unavailable(*a, **k):
+        raise emodnet.EmodnetAttributionUnavailableError("simulated WFS outage")
+
+    monkeypatch.setattr(emodnet, "_wfs_get_feature", raise_unavailable)
+
+    result = emodnet.check_native_qa_layers((1.0, 53.0, 2.0, 54.0))
+
+    assert result.download_tile_formats == ()
+    assert all(match is None for match in result.download_tile_matches.values())

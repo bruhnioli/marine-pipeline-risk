@@ -654,3 +654,152 @@ def test_resolve_bathymetry_sources_command_reports_attribution_failure(
     # a WFS outage here is a hard failure, not something to gracefully degrade.
     assert exit_code == 1
     assert "simulated WFS outage" in capsys.readouterr().err
+
+
+def test_build_regional_morphology_command_requires_pipeline_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "no_pipeline.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-regional-morphology", str(config_path)])
+
+    assert exit_code == 1
+    assert "pipeline.pipeline_id" in capsys.readouterr().err
+
+
+def test_build_regional_morphology_command_requires_chainage_bathymetry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_minimal_study_config(tmp_path)
+
+    exit_code = main(["build-regional-morphology", str(config_path)])
+
+    assert exit_code == 1
+    assert "build-bathymetry first" in capsys.readouterr().err
+
+
+def _write_regional_morphology_fixture(tmp_path: Path) -> Path:
+    """Extends the resolve-sources fixture with emodnet_cdi_sources.parquet under interim/."""
+
+    from marine_engine.preprocessing import source_resolution
+
+    config_path = _write_resolve_sources_fixture(tmp_path)
+    interim_dir = tmp_path / "interim" / "pl854"
+    interim_dir.mkdir(parents=True, exist_ok=True)
+
+    cdi_sources_df = pd.DataFrame(
+        [
+            {
+                "source_reference_id": "121954",
+                "acquisition_year": 1991,
+                "acquisition_start": "1991-04-24",
+                "acquisition_end": "1991-08-16",
+                "survey_age_at_product_release_year": 33,
+            }
+        ],
+        columns=list(source_resolution.CDI_SOURCES_COLUMNS),
+    )
+    cdi_sources_df.to_parquet(interim_dir / "emodnet_cdi_sources.parquet", index=False)
+
+    return config_path
+
+
+def test_build_regional_morphology_command_requires_cdi_sources(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_resolve_sources_fixture(tmp_path)  # no emodnet_cdi_sources.parquet written
+
+    exit_code = main(["build-regional-morphology", str(config_path)])
+
+    assert exit_code == 1
+    assert "resolve-bathymetry-sources first" in capsys.readouterr().err
+
+
+def test_build_regional_morphology_command_success(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import numpy as np
+    import rasterio
+
+    from marine_engine.morphology import regional
+    from marine_engine.providers.bathymetry import acquisition, emodnet
+    from marine_engine.providers.bathymetry.emodnet import (
+        EmodnetFetchResult,
+        NativeQaLayerAvailability,
+    )
+
+    config_path = _write_regional_morphology_fixture(tmp_path)
+
+    fake_fetch_result = EmodnetFetchResult(
+        local_path=tmp_path / "halo.tif",
+        request_parameters={"coverageId": "emodnet__mean"},
+        returned_crs="EPSG:4326",
+        width_px=10,
+        height_px=10,
+        content_type="image/tiff",
+    )
+    monkeypatch.setattr(emodnet, "fetch_emodnet_geotiff", lambda *a, **k: fake_fetch_result)
+    monkeypatch.setattr(
+        acquisition,
+        "record_acquisition",
+        lambda *a, **k: {"sha256": "deadbeef", "local_path": str(tmp_path / "halo.tif")},
+    )
+    monkeypatch.setattr(
+        emodnet,
+        "check_native_qa_layers",
+        lambda *a, **k: NativeQaLayerAvailability(
+            wcs_coverage_ids=(),
+            wcs_matches={},
+            download_tile_formats=(),
+            download_tile_matches={},
+            notes="n/a",
+        ),
+    )
+
+    fake_layer = regional.MorphologyLayer(
+        name="slope_500m_deg",
+        array=np.array([[1.0]]),
+        transform=rasterio.transform.from_origin(0.0, 1.0, 100.0, 100.0),
+        radius_m=500.0,
+        unit="degrees",
+        description="test",
+    )
+    fake_halo_grid = regional.HaloElevationGrid(
+        elevation=np.array([[1.0]]),
+        valid_mask=np.array([[True]]),
+        transform=fake_layer.transform,
+        crs="EPSG:32631",
+        raw_stats=None,
+        sign_convention_observed="negative_elevation",
+        source_sha256="deadbeef",
+    )
+    fake_result = regional.RegionalMorphologyResult(
+        chainage_df=pd.DataFrame([{"pipeline_id": "PL854", "station_index": 0}]),
+        layers=[fake_layer],
+        halo_grid=fake_halo_grid,
+        qa_layer_availability=NativeQaLayerAvailability(
+            wcs_coverage_ids=(),
+            wcs_matches={},
+            download_tile_formats=(),
+            download_tile_matches={},
+            notes="n/a",
+        ),
+        aoi_identifier="PL854_AOI",
+        working_crs="EPSG:32631",
+        processing_timestamp="2026-01-01T00:00:00+00:00",
+    )
+    monkeypatch.setattr(regional, "build_regional_morphology", lambda **k: fake_result)
+    monkeypatch.setattr(regional, "write_morphology_raster", lambda *a, **k: None)
+    monkeypatch.setattr(regional, "write_chainage_regional_morphology", lambda *a, **k: None)
+    monkeypatch.setattr(regional, "write_morphology_metadata", lambda *a, **k: None)
+    monkeypatch.setattr(regional, "print_regional_morphology_report", lambda *a, **k: None)
+
+    exit_code = main(["build-regional-morphology", str(config_path)])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "morphology raster" in out

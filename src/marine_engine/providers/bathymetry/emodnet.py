@@ -25,6 +25,7 @@ Role: MANDATORY full-AOI baseline / QA comparison layer -- `inventory.py`
 never promotes it to "high-resolution primary" merely for being available.
 """
 
+import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -467,4 +468,123 @@ def check_msl_availability(
         format_label=None,
         download_url=None,
         notes=f"No 'Mean Sea Level' product_format found for release={release} at this AOI.",
+    )
+
+
+# --- Native per-cell QA layer discovery (MAR-007) ----------------------------
+#
+# MAR-007 asks whether EMODnet exposes additional per-cell DTM attributes
+# (min/max/std depth, number of contributing values, interpolation flag,
+# smoothed-depth offset) as machine-readable coverage, without guessing
+# coverage ids. Discovery here is genuinely live each call (never a frozen
+# list) so it stays correct if EMODnet's own offering changes:
+#
+# 1. WCS GetCapabilities is parsed for every advertised CoverageId and
+#    checked for QA-attribute keywords -- confirmed live that, as of this
+#    implementation, only `emodnet__mean` and its year/land/colour variants
+#    are advertised; no separate min/max/sd/count/flag coverage exists.
+# 2. The already-integrated `emodnet:download_tiles` WFS is checked for a
+#    matching `product_format` -- confirmed live that only "SD" (standard
+#    deviation) has any match, as a whole-tile ~150 MB archive (not
+#    AOI-clipped; bigger than the MSL tile MAR-006 already judged out of
+#    scope). This is a bulk download, not a live/queryable machine-readable
+#    per-cell coverage, so it is reported as found-but-not-fetched rather
+#    than treated as satisfying this ticket's "machine-readable coverage"
+#    requirement.
+#
+# Nothing here is downloaded; this only reports what exists.
+
+QA_ATTRIBUTE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "minimum_depth": ("min",),
+    "maximum_depth": ("max",),
+    "depth_std": ("sd", "std", "stdev", "standard deviation", "standarddeviation"),
+    "n_values": ("count", "n_values", "nvalues", "number of values", "numberofvalues"),
+    "interpolation_flag": ("interp", "extrapol", "flag"),
+    "mean_smoothed_depth": ("smooth",),
+}
+
+_COVERAGE_ID_RE = re.compile(r"<wcs:CoverageId>([^<]+)</wcs:CoverageId>")
+
+
+@dataclass(frozen=True)
+class NativeQaLayerAvailability:
+    """What (if anything) official EMODnet services expose for per-cell QA attributes.
+
+    `wcs_matches`/`download_tile_matches` map each requested attribute name
+    to the real coverage id / product_format that matched it, or None if
+    nothing did -- never fabricated, never guessed.
+    """
+
+    wcs_coverage_ids: tuple[str, ...]
+    wcs_matches: dict[str, str | None]
+    download_tile_formats: tuple[str, ...]
+    download_tile_matches: dict[str, str | None]
+    notes: str
+
+
+def list_wcs_coverage_ids() -> list[str]:
+    """Every CoverageId currently advertised by the real EMODnet WCS GetCapabilities."""
+
+    params = {"service": "WCS", "version": "2.0.1", "request": "GetCapabilities"}
+    response = requests.get(WCS_BASE_URL, params=params, timeout=REQUEST_TIMEOUT_S)
+    response.raise_for_status()
+    return _COVERAGE_ID_RE.findall(response.text)
+
+
+def _first_keyword_match(candidates: list[str], keywords: tuple[str, ...]) -> str | None:
+    for candidate in candidates:
+        lowered = candidate.lower()
+        if any(keyword in lowered for keyword in keywords):
+            return candidate
+    return None
+
+
+def check_native_qa_layers(
+    aoi_bbox_wgs84: tuple[float, float, float, float], release: str | None = TARGET_RELEASE
+) -> NativeQaLayerAvailability:
+    """Live-check (never bulk-download) official per-cell QA layer availability.
+
+    See the module-level comment above for what was actually found.
+    """
+
+    try:
+        coverage_ids = list_wcs_coverage_ids()
+    except requests.RequestException:
+        coverage_ids = []
+    wcs_matches = {
+        attr: _first_keyword_match(coverage_ids, keywords)
+        for attr, keywords in QA_ATTRIBUTE_KEYWORDS.items()
+    }
+
+    try:
+        data = _wfs_get_feature(DOWNLOAD_TILES_LAYER, aoi_bbox_wgs84)
+        formats = sorted(
+            {
+                props.get("product_format")
+                for entry in data.get("features", [])
+                for props in (entry.get("properties", {}),)
+                if props.get("product_format")
+                and (release is None or props.get("dtm_release") == release)
+            }
+        )
+    except EmodnetAttributionUnavailableError:
+        formats = []
+    download_tile_matches = {
+        attr: _first_keyword_match(formats, keywords)
+        for attr, keywords in QA_ATTRIBUTE_KEYWORDS.items()
+    }
+
+    return NativeQaLayerAvailability(
+        wcs_coverage_ids=tuple(coverage_ids),
+        wcs_matches=wcs_matches,
+        download_tile_formats=tuple(formats),
+        download_tile_matches=download_tile_matches,
+        notes=(
+            "No live WCS coverage advertises a separate minimum/maximum/std/count/"
+            "interpolation-flag/smoothed-depth layer for this release. The only official "
+            "match is a whole-tile 'SD' (standard deviation) download via "
+            "emodnet:download_tiles (~150 MB, not AOI-clipped) -- a bulk archive, not a "
+            "live machine-readable per-cell coverage, so it is not fetched here. All "
+            "native cell QA chainage fields are recorded as null with this status."
+        ),
     )

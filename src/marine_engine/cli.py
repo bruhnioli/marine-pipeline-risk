@@ -11,6 +11,7 @@ from shapely.ops import unary_union
 
 from marine_engine import __version__
 from marine_engine.config import load_study_config
+from marine_engine.morphology import regional
 from marine_engine.preprocessing import bathymetry, source_resolution
 from marine_engine.preprocessing.aoi import (
     InvalidAoiGeometryError,
@@ -465,6 +466,147 @@ def _cmd_resolve_bathymetry_sources(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_regional_morphology(args: argparse.Namespace) -> int:
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    _pipeline_gpkg_path, aoi_gpkg_path, chainage_gpkg_path, interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+    chainage_bathymetry_path = study_dir / "bathymetry" / "chainage_bathymetry.parquet"
+    cdi_sources_path = interim_dir / "emodnet_cdi_sources.parquet"
+    canonical_dtm_path = study_dir / "bathymetry" / "emodnet_baseline_lat_100m.tif"
+
+    if not chainage_bathymetry_path.exists():
+        print(
+            f"error: no chainage bathymetry attribution found at {chainage_bathymetry_path}; "
+            "run build-bathymetry first",
+            file=sys.stderr,
+        )
+        return 1
+    if not cdi_sources_path.exists():
+        print(
+            f"error: no CDI source provenance found at {cdi_sources_path}; "
+            "run resolve-bathymetry-sources first",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        aoi_gdf = gpd.read_file(aoi_gpkg_path, layer="study_aoi")
+        chainage_gdf = gpd.read_file(chainage_gpkg_path, layer="chainage_points")
+        chainage_bathymetry_df = pd.read_parquet(chainage_bathymetry_path)
+        cdi_sources_df = pd.read_parquet(cdi_sources_path)
+    except Exception as exc:  # noqa: BLE001 -- one clear message regardless of the underlying cause
+        print(
+            f"error: could not load canonical AOI/chainage/bathymetry/provenance: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    working_crs = config.crs.horizontal
+    aoi_geom_working = unary_union(aoi_gdf.geometry)
+    halo_bbox_wgs84 = regional.build_halo_bbox_wgs84(aoi_geom_working, working_crs)
+
+    manifest_path = interim_dir / "bathymetry_acquisition_manifest.json"
+    halo_dataset_id = f"{emodnet.COVERAGE_ID}_halo_{pipeline_id.lower()}"
+    raw_halo_path = (
+        acquisition.raw_dataset_dir(config.paths.raw_dir, "emodnet", halo_dataset_id)
+        / f"{halo_dataset_id}.tif"
+    )
+    # Must match exactly what `fetch_emodnet_geotiff` itself records as
+    # `request_parameters` (coverageId/bbox_wgs84/format only) -- any extra
+    # key here would never equal the stored entry and defeat idempotency,
+    # re-fetching this halo on every single run.
+    request_parameters = {
+        "coverageId": emodnet.COVERAGE_ID,
+        "bbox_wgs84": list(halo_bbox_wgs84),
+        "format": "image/tiff;application=geotiff",
+    }
+    existing = acquisition.already_acquired(
+        manifest_path, "EMODnet", halo_dataset_id, request_parameters
+    )
+    if existing is not None:
+        print(f"EMODnet halo: already acquired ({existing['local_path']}); skipping re-download.")
+        halo_manifest_entry = existing
+    else:
+        try:
+            fetch_result = emodnet.fetch_emodnet_geotiff(halo_bbox_wgs84, raw_halo_path)
+        except emodnet.EmodnetUnavailableError as exc:
+            print(f"error: EMODnet halo acquisition failed: {exc}", file=sys.stderr)
+            return 1
+        halo_manifest_entry = acquisition.record_acquisition(
+            manifest_path,
+            source="EMODnet",
+            dataset_id=halo_dataset_id,
+            source_url_or_service=emodnet.WCS_BASE_URL,
+            request_parameters=fetch_result.request_parameters,
+            local_path=fetch_result.local_path,
+            licence=emodnet.LICENCE,
+            acquisition_year=2024,
+            horizontal_crs=fetch_result.returned_crs,
+            vertical_datum=emodnet.VERTICAL_DATUM,
+            nominal_resolution_m=emodnet.NATIVE_RESOLUTION_M,
+            acquired_at=datetime.now(UTC),
+        )
+        print(
+            f"EMODnet halo: acquired {fetch_result.width_px}x{fetch_result.height_px} px "
+            f"-> {fetch_result.local_path}"
+        )
+
+    qa_layer_availability = emodnet.check_native_qa_layers(halo_bbox_wgs84)
+
+    try:
+        result = regional.build_regional_morphology(
+            aoi_gdf=aoi_gdf,
+            chainage_gdf=chainage_gdf,
+            chainage_bathymetry_df=chainage_bathymetry_df,
+            cdi_sources_df=cdi_sources_df,
+            raw_halo_path=raw_halo_path,
+            raw_halo_manifest_entry=halo_manifest_entry,
+            qa_layer_availability=qa_layer_availability,
+            working_crs=working_crs,
+            aoi_identifier=f"{pipeline_id}_AOI",
+        )
+    except (
+        bathymetry.InvalidRawRasterError,
+        bathymetry.AmbiguousSignConventionError,
+        regional.RegionalMorphologyError,
+    ) as exc:
+        print(f"error: regional morphology build failed: {exc}", file=sys.stderr)
+        return 1
+
+    morphology_dir = study_dir / "morphology"
+    raster_paths = {}
+    for layer in result.layers:
+        raster_path = morphology_dir / f"{layer.name}.tif"
+        regional.write_morphology_raster(
+            layer, working_crs, raster_path, aoi_identifier=f"{pipeline_id}_AOI"
+        )
+        raster_paths[layer.name] = raster_path
+
+    chainage_output_path = morphology_dir / "chainage_regional_morphology.parquet"
+    regional.write_chainage_regional_morphology(result.chainage_df, chainage_output_path)
+
+    metadata_path = morphology_dir / "morphology_metadata.json"
+    regional.write_morphology_metadata(
+        result,
+        input_dtm_path=canonical_dtm_path,
+        raster_paths=raster_paths,
+        output_path=metadata_path,
+    )
+
+    print(f"Wrote {len(raster_paths)} morphology raster(s), chainage table, and metadata to:")
+    print(f"  {morphology_dir}")
+    print()
+    regional.print_regional_morphology_report(result)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="marine-engine",
@@ -543,6 +685,19 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     resolve_sources_parser.set_defaults(func=_cmd_resolve_bathymetry_sources)
+
+    build_morphology_parser = subparsers.add_parser(
+        "build-regional-morphology",
+        help=(
+            "Build broad (500/1000/2000 m-scale) regional seabed morphology context "
+            "(slope, TPI, local relief) from the EMODnet baseline, with an analysis halo "
+            "to avoid AOI-edge bias, and join MAR-006B/C source-age provenance onto chainage."
+        ),
+    )
+    build_morphology_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_morphology_parser.set_defaults(func=_cmd_build_regional_morphology)
 
     return parser
 

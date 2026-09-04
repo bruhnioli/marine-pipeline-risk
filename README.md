@@ -42,9 +42,9 @@ entry point over that config system.
 
 Beyond the NSTA provider (MAR-002), AOI/chainage preprocessing
 (MAR-003/004), bathymetry source discovery (MAR-005), the canonical
-EMODnet baseline DTM (MAR-006), and CDI source-survey resolution
-(MAR-006B), the stage packages contain no algorithms yet — see "Status"
-below.
+EMODnet baseline DTM (MAR-006), CDI source-survey resolution (MAR-006B),
+and broad regional seabed morphology (MAR-007), the stage packages contain
+no algorithms yet — see "Status" below.
 
 ## Project layout
 
@@ -74,11 +74,13 @@ uv run marine-engine discover-bathymetry configs/pl854.yaml
 uv run marine-engine fetch-bathymetry configs/pl854.yaml
 uv run marine-engine build-bathymetry configs/pl854.yaml
 uv run marine-engine resolve-bathymetry-sources configs/pl854.yaml
+uv run marine-engine build-regional-morphology configs/pl854.yaml
 ```
 
 `ingest-pipeline`, `discover-bathymetry`, `fetch-bathymetry`,
-`build-bathymetry`, and `resolve-bathymetry-sources` require network access
-to public services (NSTA, MEDIN, BGS GeoNetwork, EMODnet, SeaDataNet CDI).
+`build-bathymetry`, `resolve-bathymetry-sources`, and
+`build-regional-morphology` require network access to public services
+(NSTA, MEDIN, BGS GeoNetwork, EMODnet, SeaDataNet CDI).
 Their live-source smoke tests are excluded from the default test run; opt
 in with `uv run pytest -m live`.
 
@@ -192,4 +194,42 @@ in with `uv run pytest -m live`.
   ticket's own output from `data/processed/pl854/bathymetry/` to
   `data/interim/pl854/` -- it is provenance-resolution metadata, not an
   analysis-ready product; the canonical DTM and chainage-bathymetry outputs
-  are unaffected. No further ticket has started.
+  are unaffected.
+- `MAR-006D`: a further recovery-potential fix. `SOURCE_RESOLUTION_UNKNOWN`
+  vs `HIGH_RES_SOURCE_*` had been checking both `horizontal_resolution_note`
+  and `vertical_resolution_note`, but vertical resolution/accuracy (how
+  precisely depth is measured) does not establish horizontal spatial/grid
+  resolution (how densely the seabed is sampled) -- a sub-metre vertical
+  figure could have incorrectly triggered a `HIGH_RES_SOURCE_*` result with
+  no horizontal resolution stated at all. Fixed to consider only
+  `horizontal_resolution_note`; `vertical_resolution_note` remains
+  preserved as metadata everywhere else. PL854's three records are
+  unaffected (`SOURCE_RESOLUTION_UNKNOWN`, as before).
+- `MAR-007`: broad (500/1000/2000 m-scale) regional seabed morphology
+  context (`morphology/regional.py`) from the EMODnet baseline --
+  local-plane-fit slope, Topographic Position Index, local relief, and
+  terrain variability, computed on a 2.2 km analysis halo beyond the
+  canonical AOI (to avoid edge bias) and then clipped back to it. Outputs:
+  `data/processed/pl854/morphology/{slope_500m_deg,slope_1000m_deg,
+  tpi_1000m_m,tpi_2000m_m,local_relief_1000m_m,local_relief_2000m_m,
+  terrain_std_1000m_m,terrain_std_2000m_m}.tif`,
+  `chainage_regional_morphology.parquet` (941 stations), and
+  `morphology_metadata.json`. No curvature, rugosity, TRI, or aspect; no
+  sand-wave crest/trough/wavelength detection; no scour, free-span, or risk
+  scoring -- none of that is supported by this baseline (see below).
+
+  **These are broad regional morphology derivatives, not present-day local
+  pipeline survey products.** The source bathymetry underlying 100% of
+  PL854 is from CDI surveys acquired in 1991 (~99% of the route) and 1992
+  (~1%) -- confirmed from the actual joined MAR-006B/C provenance, not
+  assumed. EMODnet 2024 is the DTM *product release* year, never the
+  acquisition year. These broad, kilometre-scale features are appropriate
+  for regional gradient and bank/flank/channel-scale context only; they
+  must NOT be read as current sand-wave crests/troughs, local pipeline
+  scour, metre-scale roughness, embedment, or free-span condition -- no
+  such mapping has been performed. EMODnet's official per-cell QA
+  attributes (min/max/std depth, sample count, interpolation flag) were
+  checked live and found unavailable as a small/queryable coverage for
+  this release (only a whole-tile, non-AOI-clipped "SD" archive exists);
+  the corresponding chainage fields are recorded as null rather than
+  fabricated. No further ticket has started.
