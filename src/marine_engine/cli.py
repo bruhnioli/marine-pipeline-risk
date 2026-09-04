@@ -11,7 +11,7 @@ from shapely.ops import unary_union
 
 from marine_engine import __version__
 from marine_engine.config import load_study_config
-from marine_engine.preprocessing import bathymetry
+from marine_engine.preprocessing import bathymetry, source_resolution
 from marine_engine.preprocessing.aoi import (
     InvalidAoiGeometryError,
     InvalidPipelineInputError,
@@ -393,6 +393,74 @@ def _cmd_build_bathymetry(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_resolve_bathymetry_sources(args: argparse.Namespace) -> int:
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    pipeline_gpkg_path, aoi_gpkg_path, chainage_gpkg_path, _interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+    chainage_bathymetry_path = study_dir / "bathymetry" / "chainage_bathymetry.parquet"
+
+    if not chainage_bathymetry_path.exists():
+        print(
+            f"error: no chainage bathymetry attribution found at {chainage_bathymetry_path}; "
+            "run build-bathymetry first",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        pipeline_gdf = gpd.read_file(pipeline_gpkg_path, layer="pipeline")
+        aoi_gdf = gpd.read_file(aoi_gpkg_path, layer="study_aoi")
+        chainage_gdf = gpd.read_file(chainage_gpkg_path, layer="chainage_points")
+        chainage_bathymetry = pd.read_parquet(chainage_bathymetry_path)
+    except Exception as exc:  # noqa: BLE001 -- one clear message regardless of the underlying cause
+        print(
+            f"error: could not load canonical pipeline/AOI/chainage/bathymetry: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    working_crs = config.crs.horizontal
+    aoi_bbox_wgs84 = tuple(float(v) for v in aoi_gdf.to_crs("EPSG:4326").total_bounds)
+
+    try:
+        source_refs = emodnet.fetch_source_references(aoi_bbox_wgs84)
+        qi_features = emodnet.fetch_quality_index(aoi_bbox_wgs84)
+    except emodnet.EmodnetAttributionUnavailableError as exc:
+        print(
+            f"error: could not retrieve EMODnet source-reference attribution: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    df, records, overlaps = source_resolution.resolve_pl854_cdi_sources(
+        pipeline_gdf=pipeline_gdf,
+        aoi_gdf=aoi_gdf,
+        chainage_gdf=chainage_gdf,
+        chainage_bathymetry=chainage_bathymetry,
+        source_reference_features=source_refs,
+        quality_index_features=qi_features,
+        working_crs=working_crs,
+    )
+
+    parquet_path = study_dir / "bathymetry" / "emodnet_cdi_sources.parquet"
+    gpkg_path = study_dir / "bathymetry" / "emodnet_cdi_sources.gpkg"
+    source_resolution.write_cdi_sources_parquet(df, parquet_path)
+    source_resolution.write_cdi_sources_gpkg(records, working_crs, gpkg_path)
+
+    print(f"Resolved {len(df)} PL854 source-reference record(s).")
+    print(f"Output: {parquet_path}")
+    print()
+    source_resolution.print_source_resolution_report(df, overlaps)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="marine-engine",
@@ -459,6 +527,18 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_bathymetry_parser.set_defaults(func=_cmd_build_bathymetry)
+
+    resolve_sources_parser = subparsers.add_parser(
+        "resolve-bathymetry-sources",
+        help=(
+            "Resolve PL854's EMODnet source-reference ids to their real SeaDataNet CDI "
+            "survey provenance (acquisition epoch, instrument, access, recovery potential)."
+        ),
+    )
+    resolve_sources_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    resolve_sources_parser.set_defaults(func=_cmd_resolve_bathymetry_sources)
 
     return parser
 

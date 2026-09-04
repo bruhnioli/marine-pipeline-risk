@@ -48,6 +48,7 @@ CANONICAL_COLUMNS = (
     "survey_start_date",
     "survey_end_date",
     "acquisition_year",
+    "product_release_year",
     "data_type",
     "survey_method",
     "nominal_resolution_m",
@@ -83,6 +84,18 @@ class SurveyRecord:
     `geometry_wgs84` is the survey footprint as reported by the source (EPSG:4326),
     kept separate from the flat table columns above -- it is written only to the
     optional GeoPackage output, never fabricated from a title or a single point.
+
+    `acquisition_year` vs `product_release_year` (MAR-006B): these are
+    deliberately distinct and must never be used interchangeably.
+    `acquisition_year` is when the underlying survey measurements were
+    actually collected -- for a real survey (BGS, UKHO, or a CDI-resolved
+    EMODnet source), record it there. `product_release_year` is the
+    release/publication year of an aggregate/composite product (e.g. the
+    EMODnet DTM 2024 release) and says nothing about when any individual
+    survey inside that composite was measured. An aggregate composite
+    product should set `product_release_year` and leave `acquisition_year`
+    as None rather than borrowing the release year as a false acquisition
+    date.
     """
 
     source: str
@@ -93,6 +106,7 @@ class SurveyRecord:
     survey_start_date: str | None = None
     survey_end_date: str | None = None
     acquisition_year: int | None = None
+    product_release_year: int | None = None
     data_type: str | None = None
     survey_method: str | None = None
     nominal_resolution_m: float | None = None
@@ -422,6 +436,7 @@ def build_inventory_dataframe(records: list[SurveyRecord]) -> pd.DataFrame:
                 "survey_start_date": r.survey_start_date,
                 "survey_end_date": r.survey_end_date,
                 "acquisition_year": r.acquisition_year,
+                "product_release_year": r.product_release_year,
                 "data_type": r.data_type,
                 "survey_method": r.survey_method,
                 "nominal_resolution_m": r.nominal_resolution_m,

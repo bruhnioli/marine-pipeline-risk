@@ -41,9 +41,10 @@ YAML configuration files under `configs/`. `cli.py` is a thin argparse
 entry point over that config system.
 
 Beyond the NSTA provider (MAR-002), AOI/chainage preprocessing
-(MAR-003/004), bathymetry source discovery (MAR-005), and the canonical
-EMODnet baseline DTM (MAR-006), the stage packages contain no algorithms
-yet — see "Status" below.
+(MAR-003/004), bathymetry source discovery (MAR-005), the canonical
+EMODnet baseline DTM (MAR-006), and CDI source-survey resolution
+(MAR-006B), the stage packages contain no algorithms yet — see "Status"
+below.
 
 ## Project layout
 
@@ -72,12 +73,14 @@ uv run marine-engine build-chainage configs/pl854.yaml
 uv run marine-engine discover-bathymetry configs/pl854.yaml
 uv run marine-engine fetch-bathymetry configs/pl854.yaml
 uv run marine-engine build-bathymetry configs/pl854.yaml
+uv run marine-engine resolve-bathymetry-sources configs/pl854.yaml
 ```
 
-`ingest-pipeline`, `discover-bathymetry`, `fetch-bathymetry`, and
-`build-bathymetry` require network access to public services (NSTA, MEDIN,
-BGS GeoNetwork, EMODnet). Their live-source smoke tests are excluded from
-the default test run; opt in with `uv run pytest -m live`.
+`ingest-pipeline`, `discover-bathymetry`, `fetch-bathymetry`,
+`build-bathymetry`, and `resolve-bathymetry-sources` require network access
+to public services (NSTA, MEDIN, BGS GeoNetwork, EMODnet, SeaDataNet CDI).
+Their live-source smoke tests are excluded from the default test run; opt
+in with `uv run pytest -m live`.
 
 ## Status
 
@@ -139,5 +142,34 @@ the default test run; opt in with `uv run pytest -m live`.
      changing the canonical pipeline/chainage architecture.
 
   Still no sediment/metocean providers, erosion/deposition or risk science,
-  no ML, no web app — those arrive in later tickets. `MAR-006B` has not
-  started.
+  no ML, no web app — those arrive in later tickets.
+- `MAR-006B`: PL854 EMODnet CDI source-survey resolution
+  (`providers/bathymetry/cdi.py`, `preprocessing/source_resolution.py`)
+  follows each of the three real 2024-release `source_references` ids that
+  cross the pipeline (`110153`, `121953`, `121954`) through their official
+  SeaDataNet CDI `metadata_url` to real survey provenance: `110153` is a
+  1992 single-beam-echosounder survey ("Haddock Bank", UKHO cruise HI560,
+  covering the first ~1% of the route); `121953`/`121954` are 1991 surveys
+  (UKHO cruise HI524-HI525-HI531, instrument unstated) covering the
+  remaining ~99%. All three are 32-33 years old at the 2024 release and
+  require registration plus owner negotiation (via OceanWise/UKHO) to
+  request the original data -- none is directly downloadable. Output:
+  `data/interim/pl854/emodnet_cdi_sources.parquet`. The CDI report host
+  fronts every request with a client-side proof-of-work challenge that a
+  plain HTTP client cannot pass, so live automated resolution falls back to
+  a manually browser-verified snapshot for these three known ids and
+  reports that honestly rather than either fabricating data or crashing.
+
+  **`EMODnet DTM 2024` is a product release/version, not a seabed survey
+  date -- do not read "2024" as when this bathymetry was measured.** This
+  ticket's audit fix makes that explicit in the schema itself:
+  `SurveyRecord` now has a separate `product_release_year` field: the
+  EMODnet composite sets `product_release_year=2024` and leaves
+  `acquisition_year=None`, while each CDI-resolved underlying survey
+  carries its own real `acquisition_year` (1991/1992 here) and
+  `survey_age_at_product_release_year`.
+
+  Still no morphology, sediment/metocean, erosion/deposition,
+  scour/free-span, or risk science, no ML, no web app, no LAT/MSL
+  conversion, and no SeaDataNet data request was submitted. No further
+  ticket has started.

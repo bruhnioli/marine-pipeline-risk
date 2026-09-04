@@ -120,6 +120,19 @@ def test_discover_emodnet_baseline_footprint_matches_requested_bbox():
     assert record.vertical_datum == "LAT"
 
 
+def test_discover_emodnet_baseline_separates_product_release_from_acquisition_year():
+    """MAR-006B: 2024 is when EMODnet published this DTM, not when the
+    underlying surveys were measured -- acquisition_year must stay None for
+    this aggregate composite, never borrow the release year."""
+
+    bbox = (1.5764758, 53.3228828, 2.0771479, 53.4341688)
+    record = emodnet.discover_emodnet_baseline(bbox)
+
+    assert record.product_release_year == 2024
+    assert record.acquisition_year is None
+    assert record.temporal_epoch is None
+
+
 # --- BGS: real-shaped Dublin Core + ISO19139 parsing --------------------------
 
 BGS_BRIEF_RECORD_XML = b"""<?xml version="1.0" encoding="UTF-8"?>

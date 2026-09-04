@@ -63,6 +63,14 @@ def discover_emodnet_baseline(aoi_bbox_wgs84: tuple[float, float, float, float])
     caller (reproducibly derived from the real aoi.gpkg) -- guaranteed to
     cover the complete AOI because that is exactly what gets requested in
     `fetch_emodnet_geotiff`, not asserted from the product title.
+
+    `product_release_year=2024` records when EMODnet published this DTM
+    *release*; `acquisition_year` is deliberately left None because 2024 is
+    not when the underlying bathymetric surveys were measured -- MAR-006's
+    own source-reference attribution shows this composite is itself built
+    from older CDI surveys (resolved individually in MAR-006B). Likewise
+    `temporal_epoch=None`: labelling an aggregate multi-source composite
+    with a single year would misrepresent it as one acquisition epoch.
     """
 
     west, south, east, north = aoi_bbox_wgs84
@@ -76,7 +84,8 @@ def discover_emodnet_baseline(aoi_bbox_wgs84: tuple[float, float, float, float])
         survey_name=None,
         survey_start_date=None,
         survey_end_date=None,
-        acquisition_year=2024,
+        acquisition_year=None,
+        product_release_year=2024,
         data_type="DTM",
         survey_method="composite/aggregated bathymetric DTM (multi-source)",
         nominal_resolution_m=NATIVE_RESOLUTION_M,
@@ -87,8 +96,13 @@ def discover_emodnet_baseline(aoi_bbox_wgs84: tuple[float, float, float, float])
         download_available=True,
         manual_download_required=False,
         acquisition_status="numerically_acquired",
-        temporal_epoch="2024",
-        notes=f"Full-AOI baseline; not a high-resolution pipeline-scale dataset. {ACCESS_NOTE}",
+        temporal_epoch=None,
+        notes=(
+            "Full-AOI baseline; not a high-resolution pipeline-scale dataset. "
+            "product_release_year=2024 is the DTM release year, NOT the acquisition "
+            "year of the underlying surveys (see MAR-006B source-reference resolution "
+            f"for the real per-survey acquisition epochs). {ACCESS_NOTE}"
+        ),
         geometry_wgs84=footprint,
     )
 

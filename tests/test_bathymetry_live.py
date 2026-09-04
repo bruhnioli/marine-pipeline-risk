@@ -9,7 +9,7 @@ reachable. Run explicitly with:
 
 import pytest
 
-from marine_engine.providers.bathymetry import bgs, emodnet, ukho
+from marine_engine.providers.bathymetry import bgs, cdi, emodnet, ukho
 
 pytestmark = pytest.mark.live
 
@@ -61,3 +61,23 @@ def test_emodnet_msl_availability_check_is_reachable():
     # Either a real acquisition mechanism was found, or a clear reason it
     # wasn't -- never a silent gap.
     assert result.notes
+
+
+def test_cdi_report_host_bot_challenge_still_blocks_plain_http(tmp_path):
+    """Documents current real-world behaviour, not a hard requirement.
+
+    As of MAR-006B, the CDI report host fronts every request with a
+    client-side proof-of-work challenge that a plain HTTP client cannot
+    solve (see cdi.py's module docstring) -- `resolve_cdi_record` falls
+    back to a manually-verified snapshot for PL854's three known ids. This
+    test just confirms that finding is still accurate; if the host ever
+    stops challenging plain clients, `fetch_cdi_report_html` should then
+    return real HTML instead of raising, which this test also accepts.
+    """
+
+    url = cdi.cdi_report_url(2607, "110153")
+    try:
+        html = cdi.fetch_cdi_report_html(url)
+    except cdi.CdiUnavailableError:
+        return  # still challenged -- the documented, expected state
+    assert "Haddock Bank" in html  # host stopped challenging; real content came through

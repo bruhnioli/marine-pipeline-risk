@@ -40,6 +40,9 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
 # fixtures; reflowing them would reduce their fidelity to what the live
 # services actually return.
 "tests/test_bathymetry_sources.py" = ["E501"]
+# Embeds real (trimmed) SeaDataNet CDI report HTML/JSON-LD verbatim as test
+# fixtures, for the same reason.
+"tests/test_cdi.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

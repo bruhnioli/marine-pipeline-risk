@@ -489,3 +489,121 @@ def test_build_bathymetry_command_reports_dtm_build_failure(
 
     assert exit_code == 1
     assert "canonical DTM build failed" in capsys.readouterr().err
+
+
+def test_resolve_bathymetry_sources_command_requires_pipeline_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "no_pipeline.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["resolve-bathymetry-sources", str(config_path)])
+
+    assert exit_code == 1
+    assert "pipeline.pipeline_id" in capsys.readouterr().err
+
+
+def test_resolve_bathymetry_sources_command_requires_chainage_bathymetry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_minimal_study_config(tmp_path)
+
+    exit_code = main(["resolve-bathymetry-sources", str(config_path)])
+
+    assert exit_code == 1
+    assert "build-bathymetry first" in capsys.readouterr().err
+
+
+def _write_resolve_sources_fixture(tmp_path: Path) -> Path:
+    """Extends the build-bathymetry fixture with pipeline.gpkg and chainage_bathymetry.parquet."""
+
+    from marine_engine.preprocessing.bathymetry import CHAINAGE_OUTPUT_COLUMNS
+
+    config_path = _write_build_bathymetry_fixture(tmp_path)
+    study_dir = tmp_path / "processed" / "pl854"
+
+    pipeline_gdf = gpd.GeoDataFrame(
+        [{"pipeline_id": "PL854", "source": "test", "status": "ACTIVE"}],
+        geometry=[LineString([(500000.0, 5900000.0), (500100.0, 5900000.0)])],
+        crs="EPSG:32631",
+    )
+    pipeline_gdf.to_file(study_dir / "pipeline.gpkg", driver="GPKG", layer="pipeline")
+
+    chainage_bathymetry_dir = study_dir / "bathymetry"
+    chainage_bathymetry_dir.mkdir(parents=True, exist_ok=True)
+    chainage_bathymetry_df = pd.DataFrame(
+        [
+            {
+                "pipeline_id": "PL854",
+                "station_index": 0,
+                "chainage_m": 0.0,
+                "kp_label": "KP 0.000",
+                "depth_lat_m": 25.0,
+                "bathymetry_source_product": "Test",
+                "source_reference_id": "121954",
+                "source_reference_type": "CDI",
+                "qi_age": 0,
+                "qi_horizontal": 3,
+                "qi_vertical": 4,
+                "qi_purpose": 3,
+                "qi_combined": 76.9,
+            }
+        ],
+        columns=list(CHAINAGE_OUTPUT_COLUMNS),
+    )
+    chainage_bathymetry_df.to_parquet(
+        chainage_bathymetry_dir / "chainage_bathymetry.parquet", index=False
+    )
+
+    return config_path
+
+
+def test_resolve_bathymetry_sources_command_success(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from marine_engine.preprocessing import source_resolution
+    from marine_engine.providers.bathymetry import emodnet
+
+    config_path = _write_resolve_sources_fixture(tmp_path)
+
+    fake_df = pd.DataFrame(
+        [{"source_reference_id": "121954"}], columns=list(source_resolution.CDI_SOURCES_COLUMNS)
+    )
+    monkeypatch.setattr(emodnet, "fetch_source_references", lambda *a, **k: [])
+    monkeypatch.setattr(emodnet, "fetch_quality_index", lambda *a, **k: [])
+    monkeypatch.setattr(
+        source_resolution,
+        "resolve_pl854_cdi_sources",
+        lambda **k: (fake_df, [], []),
+    )
+    monkeypatch.setattr(source_resolution, "write_cdi_sources_parquet", lambda df, path: path)
+    monkeypatch.setattr(source_resolution, "write_cdi_sources_gpkg", lambda *a, **k: None)
+
+    exit_code = main(["resolve-bathymetry-sources", str(config_path)])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Resolved 1 PL854 source-reference record" in out
+
+
+def test_resolve_bathymetry_sources_command_reports_attribution_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from marine_engine.providers.bathymetry import emodnet
+
+    config_path = _write_resolve_sources_fixture(tmp_path)
+
+    def raise_unavailable(*a, **k):
+        raise emodnet.EmodnetAttributionUnavailableError("simulated WFS outage")
+
+    monkeypatch.setattr(emodnet, "fetch_source_references", raise_unavailable)
+
+    exit_code = main(["resolve-bathymetry-sources", str(config_path)])
+
+    # Unlike build-bathymetry, resolving sources IS this command's whole job --
+    # a WFS outage here is a hard failure, not something to gracefully degrade.
+    assert exit_code == 1
+    assert "simulated WFS outage" in capsys.readouterr().err
