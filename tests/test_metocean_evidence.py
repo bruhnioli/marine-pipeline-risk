@@ -332,6 +332,83 @@ def test_build_support_node_table_station_counts_and_distance_range_correct():
     assert row["max_chainage_distance_to_node_m"] == pytest.approx(400.0)
 
 
+# --- reconcile_node_grid_indices (MAR-009A, Section 6, 17-F/G) ----------------------
+
+
+def test_reconcile_node_grid_indices_matches_by_lonlat_despite_index_shift():
+    """Section 17-F: a one-cell index shift between static and dynamic subsets
+    must not cause the wrong cell to be sampled -- reconciliation must follow
+    the node's own lon/lat identity, never reuse its static (grid_i, grid_j).
+    """
+
+    # Identified from a STATIC dataset at grid_i=0. The DYNAMIC dataset is a
+    # differently-offset subset: the node's true longitude only appears at
+    # dynamic index 1, not index 0.
+    node = evidence.SupportNode(
+        node_id="CUR_0000_0000", grid_i=0, grid_j=0, longitude=1.70, latitude=53.30
+    )
+    dynamic_longitude = np.array([1.69, 1.70, 1.71])
+    dynamic_latitude = np.array([53.30])
+
+    resolved = evidence.reconcile_node_grid_indices(node, dynamic_longitude, dynamic_latitude)
+
+    assert resolved == (1, 0)  # (lon_idx, lat_idx) -- NOT the node's own grid_i=0
+
+
+def test_reconcile_node_grid_indices_reversed_coordinate_ordering():
+    """Section 17-F (reversed-ordering variant): a descending dynamic axis is
+    still matched by value, never by position."""
+
+    node = evidence.SupportNode(
+        node_id="CUR_0000_0000", grid_i=2, grid_j=0, longitude=1.72, latitude=53.30
+    )
+    dynamic_longitude = np.array([1.72, 1.71, 1.70])  # descending
+    dynamic_latitude = np.array([53.30])
+
+    resolved = evidence.reconcile_node_grid_indices(node, dynamic_longitude, dynamic_latitude)
+
+    assert resolved == (0, 0)  # node's lon 1.72 is at dynamic index 0, not its static grid_i=2
+
+
+def test_reconcile_node_grid_indices_returns_none_when_unreconcilable():
+    """Section 17-G: no cell close enough -> explicit None, never a guessed index."""
+
+    node = evidence.SupportNode(
+        node_id="CUR_0000_0000", grid_i=0, grid_j=0, longitude=1.70, latitude=53.30
+    )
+    # A dynamic grid entirely elsewhere -- nothing near the node's real lon/lat.
+    dynamic_longitude = np.array([10.0, 10.01, 10.02])
+    dynamic_latitude = np.array([60.0, 60.01, 60.02])
+
+    resolved = evidence.reconcile_node_grid_indices(node, dynamic_longitude, dynamic_latitude)
+
+    assert resolved is None
+
+
+# --- check_depth_coordinate_alignment (Section 3) -----------------------------------
+
+
+def test_check_depth_coordinate_alignment_true_for_identical_arrays():
+    depths = np.array([0.0, 5.0, 10.0, 25.0])
+    assert evidence.check_depth_coordinate_alignment(depths, depths.copy()) is True
+
+
+def test_check_depth_coordinate_alignment_false_for_different_length():
+    assert (
+        evidence.check_depth_coordinate_alignment(np.array([0.0, 5.0, 10.0]), np.array([0.0, 5.0]))
+        is False
+    )
+
+
+def test_check_depth_coordinate_alignment_false_for_different_values():
+    assert (
+        evidence.check_depth_coordinate_alignment(
+            np.array([0.0, 5.0, 10.0]), np.array([0.0, 5.0, 11.0])
+        )
+        is False
+    )
+
+
 # --- normalize_primary_current ---------------------------------------------------
 
 
@@ -358,10 +435,11 @@ def test_normalize_primary_current_one_row_per_node_per_timestamp():
     )
     nodes = [node0, node1]
 
-    result = evidence.normalize_primary_current(
+    result, unreconciled = evidence.normalize_primary_current(
         ds,
         nodes=nodes,
         model_bathymetry_by_node_id={node0.node_id: 25.0, node1.node_id: 30.0},
+        static_mask_by_node_id=None,
         source_dataset="TEST_DATASET",
         evidence_role="PRIMARY_CURRENT",
     )
@@ -369,6 +447,7 @@ def test_normalize_primary_current_one_row_per_node_per_timestamp():
     # Exactly nodes * timestamps rows -- never one row per chainage station.
     assert len(result) == len(nodes) * len(times)
     assert set(result["current_node_id"]) == {node0.node_id, node1.node_id}
+    assert unreconciled == []
 
 
 def test_normalize_primary_current_selects_deepest_valid_level_per_row():
@@ -396,14 +475,16 @@ def test_normalize_primary_current_selects_deepest_valid_level_per_row():
         node_id="CUR_0000_0000", grid_i=0, grid_j=0, longitude=1.70, latitude=53.30
     )
 
-    result = evidence.normalize_primary_current(
+    result, unreconciled = evidence.normalize_primary_current(
         ds,
         nodes=[node],
         model_bathymetry_by_node_id={},
+        static_mask_by_node_id=None,
         source_dataset="TEST_DATASET",
         evidence_role="PRIMARY_CURRENT",
     )
 
+    assert unreconciled == []
     assert len(result) == 1
     row = result.iloc[0]
     assert row["current_sample_depth_m"] == pytest.approx(5.0)
@@ -440,14 +521,16 @@ def test_normalize_primary_current_height_above_model_bed():
         node_id="CUR_0000_0000", grid_i=0, grid_j=0, longitude=1.70, latitude=53.30
     )
 
-    result = evidence.normalize_primary_current(
+    result, unreconciled = evidence.normalize_primary_current(
         ds,
         nodes=[node],
         model_bathymetry_by_node_id={node.node_id: 27.0},
+        static_mask_by_node_id=None,
         source_dataset="TEST_DATASET",
         evidence_role="PRIMARY_CURRENT",
     )
 
+    assert unreconciled == []
     row = result.iloc[0]
     assert row["current_sample_depth_m"] == pytest.approx(25.0)  # the deepest valid level
     assert row["depth_level_index"] == 2
@@ -474,15 +557,132 @@ def test_normalize_primary_current_column_schema_matches_constant():
         node_id="CUR_0000_0000", grid_i=0, grid_j=0, longitude=1.70, latitude=53.30
     )
 
-    result = evidence.normalize_primary_current(
+    result, unreconciled = evidence.normalize_primary_current(
         ds,
         nodes=[node],
         model_bathymetry_by_node_id={},
+        static_mask_by_node_id=None,
         source_dataset="TEST_DATASET",
         evidence_role="PRIMARY_CURRENT",
     )
 
+    assert unreconciled == []
     assert list(result.columns) == list(evidence.PRIMARY_CURRENT_COLUMNS)
+
+
+def test_normalize_primary_current_uses_reconciled_indices_not_static_grid_indices():
+    """End-to-end Section 6/17-F: normalize_primary_current must sample the
+    DYNAMIC dataset at the node's lon/lat-reconciled cell, never at its
+    static (grid_i, grid_j) reused blindly against a differently-shaped
+    dynamic dataset.
+    """
+
+    times = pd.date_range("2025-01-01", periods=1, freq="h", tz="UTC")
+    depths = [0.0]
+    # The node's true longitude (1.71) sits at dynamic index 2, but the node
+    # itself carries grid_i=0 (as identified from an unrelated static grid).
+    longitudes = [1.69, 1.70, 1.71]
+    latitudes = [53.30]
+    uo_values = np.zeros((1, 1, 1, 3))
+    vo_values = np.zeros((1, 1, 1, 3))
+    uo_values[0, 0, 0, 2], vo_values[0, 0, 0, 2] = 9.0, 0.0  # the REAL cell for this node
+    uo_values[0, 0, 0, 0], vo_values[0, 0, 0, 0] = -1.0, 0.0  # decoy at the node's static grid_i
+    ds = _make_primary_current_dataset(
+        times=times,
+        depths=depths,
+        latitudes=latitudes,
+        longitudes=longitudes,
+        uo_values=uo_values,
+        vo_values=vo_values,
+    )
+    node = evidence.SupportNode(
+        node_id="CUR_0000_0000", grid_i=0, grid_j=0, longitude=1.71, latitude=53.30
+    )
+
+    result, unreconciled = evidence.normalize_primary_current(
+        ds,
+        nodes=[node],
+        model_bathymetry_by_node_id={},
+        static_mask_by_node_id=None,
+        source_dataset="TEST_DATASET",
+        evidence_role="PRIMARY_CURRENT",
+    )
+
+    assert unreconciled == []
+    assert result.iloc[0]["uo_m_s"] == pytest.approx(9.0)
+
+
+def test_normalize_primary_current_skips_and_flags_unreconcilable_node():
+    times = pd.date_range("2025-01-01", periods=1, freq="h", tz="UTC")
+    depths = [0.0]
+    longitudes = [1.70]
+    latitudes = [53.30]
+    uo_values = np.full((1, 1, 1, 1), 0.1)
+    vo_values = np.full((1, 1, 1, 1), 0.1)
+    ds = _make_primary_current_dataset(
+        times=times,
+        depths=depths,
+        latitudes=latitudes,
+        longitudes=longitudes,
+        uo_values=uo_values,
+        vo_values=vo_values,
+    )
+    # Nowhere near the dynamic dataset's only cell (1.70, 53.30).
+    far_node = evidence.SupportNode(
+        node_id="CUR_9999_9999", grid_i=0, grid_j=0, longitude=45.0, latitude=10.0
+    )
+
+    result, unreconciled = evidence.normalize_primary_current(
+        ds,
+        nodes=[far_node],
+        model_bathymetry_by_node_id={},
+        static_mask_by_node_id=None,
+        source_dataset="TEST_DATASET",
+        evidence_role="PRIMARY_CURRENT",
+    )
+
+    assert unreconciled == [far_node.node_id]
+    assert result.empty
+
+
+def test_normalize_primary_current_bathymetry_and_mask_intersection():
+    """Section 2/17-E (evidence.py integration level): a depth passing the
+    bathymetry constraint but rejected by the static mask must still be
+    excluded -- neither condition alone is sufficient.
+    """
+
+    times = pd.date_range("2025-01-01", periods=1, freq="h", tz="UTC")
+    depths = [0.0, 10.0, 20.0]
+    latitudes = [53.30]
+    longitudes = [1.70]
+    uo_values = np.full((1, 3, 1, 1), 0.3)
+    vo_values = np.full((1, 3, 1, 1), 0.4)  # all 3 depths finite
+    ds = _make_primary_current_dataset(
+        times=times,
+        depths=depths,
+        latitudes=latitudes,
+        longitudes=longitudes,
+        uo_values=uo_values,
+        vo_values=vo_values,
+    )
+    node = evidence.SupportNode(
+        node_id="CUR_0000_0000", grid_i=0, grid_j=0, longitude=1.70, latitude=53.30
+    )
+    # Bathymetry alone would allow depth 20 (bathymetry=25), but the static
+    # mask marks that deepest cell dry -- it must still be rejected.
+    mask_by_node = {node.node_id: np.array([1.0, 1.0, 0.0])}
+
+    result, unreconciled = evidence.normalize_primary_current(
+        ds,
+        nodes=[node],
+        model_bathymetry_by_node_id={node.node_id: 25.0},
+        static_mask_by_node_id=mask_by_node,
+        source_dataset="TEST_DATASET",
+        evidence_role="PRIMARY_CURRENT",
+    )
+
+    assert unreconciled == []
+    assert result.iloc[0]["current_sample_depth_m"] == pytest.approx(10.0)
 
 
 def test_normalize_primary_current_naming_never_calls_it_bottom_or_seabed():
@@ -492,6 +692,74 @@ def test_normalize_primary_current_naming_never_calls_it_bottom_or_seabed():
     columns_lower = [c.lower() for c in evidence.PRIMARY_CURRENT_COLUMNS]
     for forbidden in forbidden_substrings:
         assert not any(forbidden in column for column in columns_lower)
+
+
+# --- compute_below_bed_diagnostics (Section 4) --------------------------------------
+
+
+def test_compute_below_bed_diagnostics_aggregates_per_node():
+    primary_current_df = pd.DataFrame(
+        {
+            "current_node_id": ["A", "A", "B"],
+            "below_bed_finite_candidate_count": [2, 0, 1],
+            "max_below_bed_candidate_depth_m": [60.0, None, 45.0],
+        }
+    )
+
+    result = evidence.compute_below_bed_diagnostics(primary_current_df)
+
+    by_node = result.set_index("current_node_id")
+    assert by_node.loc["A", "below_model_bed_finite_candidate_count"] == 2
+    assert by_node.loc["A", "timestamps_with_below_bed_finite_candidates"] == 1
+    assert by_node.loc["A", "max_below_bed_candidate_depth_m"] == pytest.approx(60.0)
+    assert by_node.loc["B", "below_model_bed_finite_candidate_count"] == 1
+    assert by_node.loc["B", "timestamps_with_below_bed_finite_candidates"] == 1
+
+
+def test_compute_below_bed_diagnostics_empty_input():
+    result = evidence.compute_below_bed_diagnostics(pd.DataFrame())
+    assert result.empty
+
+
+# --- compute_primary_current_route_summary (Section 9, 19) --------------------------
+
+
+def test_compute_primary_current_route_summary_all_within_water_column_true():
+    primary_current_df = pd.DataFrame(
+        {
+            "model_bathymetry_m": [27.0, 30.0],
+            "current_sample_depth_m": [25.0, 28.0],
+            "height_above_model_bed_m": [2.0, 2.0],
+            "height_above_model_bed_valid": [True, True],
+        }
+    )
+
+    summary = evidence.compute_primary_current_route_summary(primary_current_df)
+
+    assert summary["all_within_water_column"] is True
+    assert summary["model_bathymetry_m_min"] == pytest.approx(27.0)
+    assert summary["current_sample_depth_m_max"] == pytest.approx(28.0)
+    assert summary["height_above_model_bed_m_min"] == pytest.approx(2.0)
+
+
+def test_compute_primary_current_route_summary_flags_failure():
+    primary_current_df = pd.DataFrame(
+        {
+            "model_bathymetry_m": [27.0],
+            "current_sample_depth_m": [30.0],
+            "height_above_model_bed_m": [-3.0],
+            "height_above_model_bed_valid": [False],
+        }
+    )
+
+    summary = evidence.compute_primary_current_route_summary(primary_current_df)
+
+    assert summary["all_within_water_column"] is False
+
+
+def test_compute_primary_current_route_summary_empty_input():
+    summary = evidence.compute_primary_current_route_summary(pd.DataFrame())
+    assert summary["all_within_water_column"] is None
 
 
 # --- normalize_long_term_surface_current -----------------------------------------
@@ -517,13 +785,14 @@ def test_normalize_long_term_surface_current_one_row_per_node_per_timestamp():
         node_id="LT_0001_0001", grid_i=1, grid_j=1, longitude=1.71, latitude=53.31
     )
 
-    result = evidence.normalize_long_term_surface_current(
+    result, unreconciled = evidence.normalize_long_term_surface_current(
         ds,
         nodes=[node0, node1],
         source_dataset="TEST_LT_DATASET",
         evidence_role="LONG_TERM_SURFACE_CURRENT_CONTEXT",
     )
 
+    assert unreconciled == []
     assert len(result) == 2 * 3
     assert set(result["current_lt_node_id"]) == {node0.node_id, node1.node_id}
 
@@ -547,13 +816,14 @@ def test_normalize_long_term_surface_current_marks_invalid_when_either_component
         node_id="LT_0000_0000", grid_i=0, grid_j=0, longitude=1.70, latitude=53.30
     )
 
-    result = evidence.normalize_long_term_surface_current(
+    result, unreconciled = evidence.normalize_long_term_surface_current(
         ds,
         nodes=[node],
         source_dataset="TEST_LT_DATASET",
         evidence_role="LONG_TERM_SURFACE_CURRENT_CONTEXT",
     )
 
+    assert unreconciled == []
     valid_row = result.iloc[0]
     assert valid_row["surface_current_speed_m_s"] == pytest.approx(5.0)
 
@@ -565,6 +835,54 @@ def test_normalize_long_term_surface_current_marks_invalid_when_either_component
     assert pd.isna(invalid_row["vo_surface_m_s"])
     assert pd.isna(invalid_row["surface_current_speed_m_s"])
     assert pd.isna(invalid_row["surface_current_direction_to_deg"])
+
+
+def test_normalize_long_term_surface_current_only_processes_nodes_actually_passed_in():
+    """Section 7/17-I: normalize_long_term_surface_current must emit rows ONLY
+    for the nodes it is given. The real MAR-009 bug was the CLI passing the
+    FULL wet-bbox candidate list instead of a chainage-used-only subset; this
+    pins that the function itself never reaches beyond its own `nodes` arg.
+    """
+
+    times = pd.date_range("2025-01-01", periods=2, freq="h", tz="UTC")
+    latitudes = [53.30, 53.31, 53.32]
+    longitudes = [1.70, 1.71, 1.72]
+    shape = (2, 3, 3)
+    uo_values = np.full(shape, 0.1)
+    vo_values = np.full(shape, 0.2)
+    ds = _make_long_term_current_dataset(
+        times=times,
+        latitudes=latitudes,
+        longitudes=longitudes,
+        uo_values=uo_values,
+        vo_values=vo_values,
+    )
+    # A full 3x3 wet-bbox grid (9 candidate cells), of which only 1 is ever
+    # actually assigned to a chainage station in this scenario.
+    all_candidate_nodes = [
+        evidence.SupportNode(
+            node_id=f"LT_{j:04d}_{i:04d}",
+            grid_i=i,
+            grid_j=j,
+            longitude=longitudes[i],
+            latitude=latitudes[j],
+        )
+        for j in range(3)
+        for i in range(3)
+    ]
+    used_node_ids = {"LT_0000_0000"}
+    used_nodes = [n for n in all_candidate_nodes if n.node_id in used_node_ids]
+
+    result, unreconciled = evidence.normalize_long_term_surface_current(
+        ds,
+        nodes=used_nodes,
+        source_dataset="TEST_LT_DATASET",
+        evidence_role="LONG_TERM_SURFACE_CURRENT_CONTEXT",
+    )
+
+    assert unreconciled == []
+    assert set(result["current_lt_node_id"]) == used_node_ids
+    assert len(result) == len(used_node_ids) * len(times)
 
 
 # --- normalize_wave ---------------------------------------------------------------
@@ -591,8 +909,11 @@ def test_normalize_wave_preserves_from_direction_and_derives_to_direction():
         node_id="WAVE_0000_0000", grid_i=0, grid_j=0, longitude=1.70, latitude=53.30
     )
 
-    result = evidence.normalize_wave(ds, nodes=[node], source_dataset="TEST_WAVE_DATASET")
+    result, unreconciled = evidence.normalize_wave(
+        ds, nodes=[node], source_dataset="TEST_WAVE_DATASET"
+    )
 
+    assert unreconciled == []
     # The FROM direction is preserved, never overwritten by the derived TO.
     assert np.allclose(result["wave_mean_direction_from_deg"].to_numpy(dtype=float), 45.0)
     assert np.allclose(result["wave_mean_direction_to_deg"].to_numpy(dtype=float), 225.0)
@@ -618,8 +939,11 @@ def test_normalize_wave_handles_missing_optional_variable_gracefully():
         node_id="WAVE_0000_0000", grid_i=0, grid_j=0, longitude=1.70, latitude=53.30
     )
 
-    result = evidence.normalize_wave(ds, nodes=[node], source_dataset="TEST_WAVE_DATASET")
+    result, unreconciled = evidence.normalize_wave(
+        ds, nodes=[node], source_dataset="TEST_WAVE_DATASET"
+    )
 
+    assert unreconciled == []
     assert "stokes_u_m_s" in result.columns
     assert "stokes_v_m_s" in result.columns
     assert result["stokes_u_m_s"].isna().all()
@@ -647,8 +971,11 @@ def test_normalize_wave_flags_negative_hs_as_invalid():
         node_id="WAVE_0000_0000", grid_i=0, grid_j=0, longitude=1.70, latitude=53.30
     )
 
-    result = evidence.normalize_wave(ds, nodes=[node], source_dataset="TEST_WAVE_DATASET")
+    result, unreconciled = evidence.normalize_wave(
+        ds, nodes=[node], source_dataset="TEST_WAVE_DATASET"
+    )
 
+    assert unreconciled == []
     negative_row = result.iloc[0]
     # hs_m mixes a real float (row 1) with a masked value (row 0), so the
     # masked cell lands as NaN, not a literal None -- pd.isna is the robust
@@ -659,6 +986,43 @@ def test_normalize_wave_flags_negative_hs_as_invalid():
     positive_row = result.iloc[1]
     assert positive_row["hs_m"] == pytest.approx(1.2)
     assert bool(positive_row["hs_valid"]) is True
+
+
+def test_normalize_wave_only_processes_nodes_actually_passed_in():
+    """Section 7/17-H: normalize_wave must emit rows ONLY for the nodes it is
+    given, never every wet bbox cell (the real MAR-009 report showed 330 wave
+    "support nodes" against 14 actually route-used current nodes).
+    """
+
+    times = pd.date_range("2025-01-01", periods=2, freq="3h", tz="UTC")
+    latitudes = [53.30, 53.31, 53.32]
+    longitudes = [1.70, 1.71, 1.72]
+    shape = (2, 3, 3)
+    variables = {"VHM0": np.full(shape, 1.0), "VMDR": np.full(shape, 90.0)}
+    ds = _make_wave_dataset(
+        times=times, latitudes=latitudes, longitudes=longitudes, variables=variables
+    )
+    all_candidate_nodes = [
+        evidence.SupportNode(
+            node_id=f"WAVE_{j:04d}_{i:04d}",
+            grid_i=i,
+            grid_j=j,
+            longitude=longitudes[i],
+            latitude=latitudes[j],
+        )
+        for j in range(3)
+        for i in range(3)
+    ]
+    used_node_ids = {"WAVE_0000_0000", "WAVE_0001_0001"}
+    used_nodes = [n for n in all_candidate_nodes if n.node_id in used_node_ids]
+
+    result, unreconciled = evidence.normalize_wave(
+        ds, nodes=used_nodes, source_dataset="TEST_WAVE_DATASET"
+    )
+
+    assert unreconciled == []
+    assert set(result["wave_node_id"]) == used_node_ids
+    assert len(result) == len(used_node_ids) * len(times)
 
 
 # --- compute_current_node_statistics -----------------------------------------------
@@ -832,6 +1196,24 @@ def test_compute_short_window_surface_context_ratio_null_when_no_overlap():
     assert row["short_window_surface_context_ratio_p99"] is None
 
 
+# --- compute_distance_diagnostics (Section 10) --------------------------------------
+
+
+def test_compute_distance_diagnostics_percentiles():
+    mapping_df = pd.DataFrame({"distance_m": [10.0, 20.0, 30.0, 40.0, 500.0]})
+
+    result = evidence.compute_distance_diagnostics(mapping_df)
+
+    assert result["min_m"] == pytest.approx(10.0)
+    assert result["median_m"] == pytest.approx(30.0)
+    assert result["max_m"] == pytest.approx(500.0)
+
+
+def test_compute_distance_diagnostics_empty_is_all_none():
+    result = evidence.compute_distance_diagnostics(pd.DataFrame())
+    assert result == {"min_m": None, "median_m": None, "p95_m": None, "max_m": None}
+
+
 # --- build_chainage_metocean_evidence -----------------------------------------------
 
 
@@ -943,12 +1325,20 @@ def test_build_chainage_metocean_evidence_deterministic():
 
 def test_print_metocean_evidence_report_smoke_does_not_crash_on_empty_inputs():
     buffer = io.StringIO()
+    empty_distance_diagnostics = evidence.compute_distance_diagnostics(pd.DataFrame())
 
     evidence.print_metocean_evidence_report(
         primary_current_stats=pd.DataFrame(),
+        primary_current_route_summary=evidence.compute_primary_current_route_summary(
+            pd.DataFrame()
+        ),
+        below_bed_diagnostics=pd.DataFrame(),
+        primary_distance_diagnostics=empty_distance_diagnostics,
         long_term_stats=pd.DataFrame(),
-        wave_stats=pd.DataFrame(),
+        long_term_distance_diagnostics=empty_distance_diagnostics,
         short_window_ratios=pd.DataFrame(),
+        wave_stats=pd.DataFrame(),
+        wave_distance_diagnostics=empty_distance_diagnostics,
         primary_current_actual_start=None,
         primary_current_actual_end=None,
         long_term_actual_start=None,
@@ -960,3 +1350,59 @@ def test_print_metocean_evidence_report_smoke_does_not_crash_on_empty_inputs():
 
     output = buffer.getvalue()
     assert "PL854 Metocean Forcing Evidence Base" in output
+
+
+def test_print_metocean_evidence_report_support_node_count_is_route_used_count():
+    """Section 8/17-J: the printed 'Support nodes' heading means route-used nodes.
+
+    A real MAR-009 report once showed "Waves: Support nodes: 330" -- the wet
+    bbox cell count, not the 14 route-used nodes. This pins the report to
+    `len(stats_df)` (already filtered to used nodes upstream), never to any
+    larger wet-bbox-cell count.
+    """
+
+    buffer = io.StringIO()
+    wave_stats = pd.DataFrame(
+        {
+            "wave_node_id": ["WAVE_A", "WAVE_B"],
+            "start_time_utc": [pd.Timestamp("2025-01-01", tz="UTC")] * 2,
+            "end_time_utc": [pd.Timestamp("2025-01-02", tz="UTC")] * 2,
+            "expected_3hour_count": [9, 9],
+            "valid_3hour_count": [9, 9],
+            "completeness_pct": [100.0, 100.0],
+            "hs_mean_m": [1.0, 1.1],
+            "hs_median_m": [1.0, 1.1],
+            "hs_p90_m": [1.5, 1.6],
+            "hs_p95_m": [1.6, 1.7],
+            "hs_p99_m": [1.8, 1.9],
+            "hs_max_m": [2.0, 2.1],
+            "tp_median_s": [8.0, 8.5],
+            "tp_p95_s": [9.0, 9.5],
+        }
+    )
+    empty_distance_diagnostics = evidence.compute_distance_diagnostics(pd.DataFrame())
+
+    evidence.print_metocean_evidence_report(
+        primary_current_stats=pd.DataFrame(),
+        primary_current_route_summary=evidence.compute_primary_current_route_summary(
+            pd.DataFrame()
+        ),
+        below_bed_diagnostics=pd.DataFrame(),
+        primary_distance_diagnostics=empty_distance_diagnostics,
+        long_term_stats=pd.DataFrame(),
+        long_term_distance_diagnostics=empty_distance_diagnostics,
+        short_window_ratios=pd.DataFrame(),
+        wave_stats=wave_stats,
+        wave_distance_diagnostics=empty_distance_diagnostics,
+        primary_current_actual_start=None,
+        primary_current_actual_end=None,
+        long_term_actual_start=None,
+        long_term_actual_end=None,
+        wave_actual_start=None,
+        wave_actual_end=None,
+        file=buffer,
+    )
+
+    output = buffer.getvalue()
+    assert "Route-used support nodes: 2" in output
+    assert "330" not in output

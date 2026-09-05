@@ -389,3 +389,78 @@ otherwise, never an interactive credential prompt.
   sediment mobility, wave orbital velocity, erosion/deposition, scour,
   free-span, fatigue, or risk scoring is computed anywhere in this ticket.
   No further ticket has started.
+- `MAR-009A`: the real MAR-009 acquisition subsequently completed and
+  external review of its actual output found a genuine vertical-eligibility
+  integrity failure: `select_deepest_valid_standard_level`
+  (`metocean/current.py`) checked only that `uo`/`vo` were finite, never
+  the Copernicus model's own bathymetry. On **100% of the 260,764 real
+  primary-current hourly rows across all 14 route-used support nodes**,
+  standard levels well below that cell's own model bathymetry (up to 75 m
+  deep against a bathymetry of ~23-30 m) still carried finite `uo`/`vo` --
+  direct inspection showed an identically-repeated "held/padded" fill
+  pattern below where the real profile stops varying, never a genuine
+  measurement. Fixed: a depth candidate is now eligible only when `uo`/`vo`
+  are finite AND `depth_m <= model_bathymetry_m + tolerance` AND, where the
+  static 3D `mask`'s own depth coordinate is confirmed exactly aligned to
+  the dynamic dataset's (`check_depth_coordinate_alignment` -- true for
+  this real product pair), that mask cell is wet; neither condition alone
+  would have caught every contaminated case at the one real node directly
+  inspected, so both are required and share one numerical tolerance with
+  `height_above_model_bed_m`'s own validity check so the two can never
+  disagree.
+
+  A second, independent real bug (this ticket's Section 7): long-term
+  surface current and wave normalization were called against every wet grid
+  cell in the request bounding box, not just the cells actually assigned to
+  a PL854 chainage station -- the real MAR-009 report showed 330 wave and
+  18 long-term-current time-series node ids against only 14/4 actually
+  route-used (the support-node *tables* were already correctly filtered;
+  only the time-series normalization calls were not). Fixed:
+  `_cmd_build_metocean_evidence` (`cli.py`) now builds
+  `used_primary_nodes`/`used_long_term_nodes`/`used_wave_nodes` and
+  normalizes only those. A third, defensive fix (Section 6): static and
+  dynamic dataset grid indices are no longer assumed identical -- each
+  node's canonical lon/lat is re-resolved against the dynamic dataset's own
+  coordinate arrays (`reconcile_node_grid_indices`, refused beyond 10% of
+  that axis's median grid spacing, never a guessed index) before every
+  sample. For the real PL854 primary-current product pair, static and
+  dynamic datasets happen to share identical coordinate arrays, so this
+  path was not itself the cause of the observed contamination, but is
+  exercised by dedicated index-shift, reversed-ordering, and
+  unreconcilable-coordinate tests.
+
+  Independently re-running `build-metocean-evidence` against the
+  already-downloaded raw Copernicus chunks (idempotent manifest -- zero
+  re-download confirmed across two full reruns, byte-identical raw file
+  mtimes and an unchanged 111-entry manifest) and reopening all 9 canonical
+  outputs directly confirms **ALL 260,764 canonical primary-current rows
+  are now within the Copernicus model water column**
+  (`height_above_model_bed_m` min=0.243 m, median=3.195 m, p95/max=4.868 m;
+  zero violations beyond the 1e-6 m numerical tolerance). Current speed
+  statistics changed materially now that the contaminating deep levels are
+  excluded (mean 0.245 -> 0.338 m/s, p95 0.671 -> 0.698, p99 0.770 -> 0.814,
+  max 0.954 -> 0.983 m/s; the corrected values are canonical, the old
+  values are not preserved by design) and the time-series node counts
+  collapsed to the correct route-used set (wave 330 -> 14, long-term
+  current 18 -> 4). Station-to-node distance diagnostics (min/median/p95/
+  max, never a confidence score) are now reported for all three products.
+  Model bathymetry and the canonical MAR-006 LAT bathymetry remain
+  deliberately unharmonised and unsubtracted
+  (`canonical_model_bathymetry_vertical_datums_not_harmonised = true`); new
+  metadata additionally records
+  `dynamic_grid_coordinate_reconciliation_method`,
+  `static_dynamic_coordinate_match_status` (all three products' used nodes
+  fully reconciled), `primary_current_vertical_eligibility_rule`,
+  `static_depth_mask_used = true` (the real static/dynamic depth
+  coordinates align exactly for this product), and a below-model-bed
+  finite-candidate diagnostic summary (QA only, 1,266,568 excluded
+  candidates across all 260,764 timestamps -- never entering canonical
+  statistics). 25 new offline tests were added across `test_current.py` and
+  `test_metocean_evidence.py`; the full offline suite (498 tests) and
+  repo-wide `ruff format`/`ruff check` pass clean. No bed shear stress,
+  Shields parameter, sediment mobility, erosion/deposition, scour,
+  free-span, fatigue, or risk scoring is computed anywhere in this ticket.
+  Per this ticket's explicit instruction, external scientific review of the
+  corrected height-above-bed, model bathymetry, current statistics, and
+  support-node distances is required before MAR-010 (near-bed hydrodynamic
+  formulation) begins -- no further ticket has started.

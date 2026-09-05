@@ -86,7 +86,11 @@ def test_select_deepest_valid_picks_the_max_depth_among_finite_pairs():
     uo_at_depths = np.array([0.10, 0.20, 0.30, 0.40, np.nan])
     vo_at_depths = np.array([0.01, 0.02, 0.03, 0.04, 0.05])
 
-    result = current.select_deepest_valid_standard_level(depths_m, uo_at_depths, vo_at_depths)
+    # A deep, non-restrictive bathymetry: this test is isolating the
+    # finite-pair logic, not the water-column constraint.
+    result = current.select_deepest_valid_standard_level(
+        depths_m, uo_at_depths, vo_at_depths, model_bathymetry_m=100.0
+    )
 
     assert result.depth_m == pytest.approx(25.0)
     assert result.depth_index == 3
@@ -99,7 +103,9 @@ def test_select_deepest_valid_never_selects_an_invalid_deeper_cell_when_intermed
     uo_at_depths = np.array([0.10, 0.20, 0.30, 0.40, np.nan])
     vo_at_depths = np.array([0.01, 0.02, 0.03, 0.04, 0.05])
 
-    result = current.select_deepest_valid_standard_level(depths_m, uo_at_depths, vo_at_depths)
+    result = current.select_deepest_valid_standard_level(
+        depths_m, uo_at_depths, vo_at_depths, model_bathymetry_m=100.0
+    )
 
     # depth=30 (index 4) is the deepest cell in the array but is invalid
     # (uo is NaN there) -- the deepest VALID cell, depth=25 at index 3,
@@ -117,7 +123,9 @@ def test_select_deepest_valid_works_with_unsorted_depths():
     uo_at_depths = np.array([np.nan, np.nan, 0.50, 0.30, 0.20, 0.10])
     vo_at_depths = np.array([0.05, np.nan, 0.05, 0.03, 0.02, 0.01])
 
-    result = current.select_deepest_valid_standard_level(depths_m, uo_at_depths, vo_at_depths)
+    result = current.select_deepest_valid_standard_level(
+        depths_m, uo_at_depths, vo_at_depths, model_bathymetry_m=100.0
+    )
 
     assert result.depth_m == pytest.approx(25.0)
     assert result.depth_index == 2
@@ -130,7 +138,9 @@ def test_select_deepest_valid_returns_all_none_when_nothing_finite():
     uo_at_depths = np.full(3, np.nan)
     vo_at_depths = np.full(3, np.nan)
 
-    result = current.select_deepest_valid_standard_level(depths_m, uo_at_depths, vo_at_depths)
+    result = current.select_deepest_valid_standard_level(
+        depths_m, uo_at_depths, vo_at_depths, model_bathymetry_m=100.0
+    )
 
     assert result.depth_m is None
     assert result.uo_m_s is None
@@ -143,7 +153,9 @@ def test_select_deepest_valid_requires_both_uo_and_vo_finite():
     uo_at_depths = np.array([0.10, 0.20, 0.30])
     vo_at_depths = np.array([0.01, 0.02, np.nan])
 
-    result = current.select_deepest_valid_standard_level(depths_m, uo_at_depths, vo_at_depths)
+    result = current.select_deepest_valid_standard_level(
+        depths_m, uo_at_depths, vo_at_depths, model_bathymetry_m=100.0
+    )
 
     # depth=10 has a finite uo but a NaN vo, so it is excluded even though
     # it is otherwise the deepest cell -- only depth=5 has BOTH finite.
@@ -151,6 +163,126 @@ def test_select_deepest_valid_requires_both_uo_and_vo_finite():
     assert result.depth_index == 1
     assert result.uo_m_s == pytest.approx(0.20)
     assert result.vo_m_s == pytest.approx(0.02)
+
+
+# --- physical vertical eligibility (MAR-009A regression tests A-E) -------------
+
+
+def test_physical_eligibility_excludes_finite_values_below_model_bathymetry():
+    """MAR-009A regression A: confirmed against the real PL854 acquisition,
+    where finite uo/vo at standard depths well below the model's own
+    bathymetry contaminated the canonical selection. depths=[0,10,20,25,
+    30,40], bathymetry=27 -- 25 m must win, NOT 40 m, even though uo/vo are
+    finite everywhere."""
+
+    depths_m = np.array([0.0, 10.0, 20.0, 25.0, 30.0, 40.0])
+    uo_at_depths = np.full(6, 0.2)
+    vo_at_depths = np.full(6, 0.1)
+
+    result = current.select_deepest_valid_standard_level(
+        depths_m, uo_at_depths, vo_at_depths, model_bathymetry_m=27.0
+    )
+
+    assert result.depth_m == pytest.approx(25.0)
+    assert result.depth_m != 40.0
+    # depths 30 and 40 are finite but below the model bathymetry (27 m).
+    assert result.below_bed_finite_candidate_count == 2
+    assert result.max_below_bed_candidate_depth_m == pytest.approx(40.0)
+
+
+def test_physical_eligibility_regression_b_depth_25_invalid_falls_back_to_20():
+    """MAR-009A regression B: depth 25 invalid (NaN), depth 20 valid, bed=27 -> select 20."""
+
+    depths_m = np.array([0.0, 10.0, 20.0, 25.0, 30.0])
+    uo_at_depths = np.array([0.2, 0.2, 0.2, np.nan, 0.2])
+    vo_at_depths = np.array([0.1, 0.1, 0.1, np.nan, 0.1])
+
+    result = current.select_deepest_valid_standard_level(
+        depths_m, uo_at_depths, vo_at_depths, model_bathymetry_m=27.0
+    )
+
+    assert result.depth_m == pytest.approx(20.0)
+
+
+def test_physical_eligibility_regression_c_only_below_bed_finite_gives_no_valid_current():
+    """MAR-009A regression C: finite values only below bed -> no valid canonical current."""
+
+    depths_m = np.array([0.0, 10.0, 20.0, 30.0, 40.0])
+    uo_at_depths = np.array([np.nan, np.nan, np.nan, 0.2, 0.2])
+    vo_at_depths = np.array([np.nan, np.nan, np.nan, 0.1, 0.1])
+
+    result = current.select_deepest_valid_standard_level(
+        depths_m, uo_at_depths, vo_at_depths, model_bathymetry_m=27.0
+    )
+
+    assert result.depth_m is None
+    assert result.uo_m_s is None
+    assert result.vo_m_s is None
+    assert result.below_bed_finite_candidate_count == 2
+    assert result.max_below_bed_candidate_depth_m == pytest.approx(40.0)
+
+
+def test_physical_eligibility_regression_d_height_above_bed_never_materially_negative():
+    """MAR-009A regression D: whenever a depth is selected, the height-above-bed
+    check must always agree it is valid (>= 0 within tolerance) -- the two
+    checks share the same tolerance constant by design and must never
+    disagree."""
+
+    scenarios = [
+        (np.array([0.0, 10.0, 20.0, 25.0, 30.0, 40.0]), 27.0),
+        (np.array([0.0, 5.0, 10.0]), 3.0),
+        (np.array([0.0, 3.0, 5.0, 10.0, 15.0]), 12.5),
+    ]
+    for depths_m, bathymetry in scenarios:
+        uo_at_depths = np.full(depths_m.shape, 0.2)
+        vo_at_depths = np.full(depths_m.shape, 0.1)
+
+        result = current.select_deepest_valid_standard_level(
+            depths_m, uo_at_depths, vo_at_depths, model_bathymetry_m=bathymetry
+        )
+
+        assert result.depth_m is not None
+        _height, is_valid = current.compute_height_above_model_bed_m(bathymetry, result.depth_m)
+        assert is_valid is True
+
+
+def test_physical_eligibility_regression_e_static_mask_rejects_finite_deeper_cell():
+    """MAR-009A regression E: static mask rejects a finite dynamically populated
+    depth -- even though depth=30 is within the bathymetry-based water column
+    (bed=35) and uo/vo are finite there, the static mask marks it dry, so
+    the eligible selection must fall back to depth=20."""
+
+    depths_m = np.array([0.0, 10.0, 20.0, 30.0])
+    uo_at_depths = np.full(4, 0.2)
+    vo_at_depths = np.full(4, 0.1)
+    mask_at_depths = np.array([1.0, 1.0, 1.0, np.nan])  # dry at depth=30
+
+    result = current.select_deepest_valid_standard_level(
+        depths_m,
+        uo_at_depths,
+        vo_at_depths,
+        model_bathymetry_m=35.0,
+        mask_at_depths=mask_at_depths,
+    )
+
+    assert result.depth_m == pytest.approx(20.0)
+
+
+def test_physical_eligibility_none_bathymetry_applies_no_water_column_constraint():
+    """model_bathymetry_m=None means no water-column constraint is available for
+    this node -- the caller must pass None deliberately (never omit the
+    argument); the finite-only selection then applies, unconstrained."""
+
+    depths_m = np.array([0.0, 10.0, 20.0])
+    uo_at_depths = np.full(3, 0.2)
+    vo_at_depths = np.full(3, 0.1)
+
+    result = current.select_deepest_valid_standard_level(
+        depths_m, uo_at_depths, vo_at_depths, model_bathymetry_m=None
+    )
+
+    assert result.depth_m == pytest.approx(20.0)
+    assert result.below_bed_finite_candidate_count == 0
 
 
 # --- compute_height_above_model_bed_m ------------------------------------------

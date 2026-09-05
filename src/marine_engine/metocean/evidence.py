@@ -1,4 +1,4 @@
-"""PL854 metocean forcing evidence base assembly (MAR-009).
+"""PL854 metocean forcing evidence base assembly (MAR-009/MAR-009A).
 
 Scope and interpretation (mandatory reading before touching this module)
 --------------------------------------------------------------------------
@@ -8,8 +8,8 @@ Marine model grid cells ("support nodes") -- never 941 fabricated
 independent time series (Section 4 of the ticket):
 
 - Primary current (`current_node_id`): 1.5 km 3D hourly current, deepest
-  VALID STANDARD LEVEL only (see `metocean/current.py` -- never the
-  model's native bottom cell, never called "bottom current").
+  PHYSICALLY ELIGIBLE standard level only (see `metocean/current.py` --
+  never the model's native bottom cell, never called "bottom current").
 - Long-term surface current context (`current_lt_node_id`): 7 km hourly 2D
   current, 1993 onward -- `LONG_TERM_SURFACE_CURRENT_CONTEXT` role only.
   Never used to fill a missing primary-current value, never downscaled,
@@ -20,13 +20,32 @@ independent time series (Section 4 of the ticket):
 Support nodes are the actual wet model grid cells nearest each chainage
 station -- nearest-neighbour assignment (never bilinear interpolation of
 data or masks) preserves real model-cell provenance rather than fabricating
-pipeline-resolution forcing (Section 5).
+pipeline-resolution forcing (Section 5). Only nodes ACTUALLY assigned to at
+least one chainage station are ever normalized into a time series
+(MAR-009A) -- the real PL854 acquisition confirmed that normalizing every
+wet cell in the request bbox silently inflated wave/long-term-current
+"support node" counts (330 / 18) far past the real route-used count (14 /
+4); `normalize_wave`/`normalize_long_term_surface_current`/
+`normalize_primary_current` must always be called with an
+already-filtered, chainage-used node list.
 
 Model bathymetry (`deptho` on each product's own static dataset) and the
 canonical MAR-006 `depth_lat_m` (positive-down relative to LAT) are DIFFERENT
 vertical datums and are never subtracted or compared as an "error" here
 (Section 9) -- both are carried side by side, and downstream metadata
 states `canonical_model_bathymetry_vertical_datums_not_harmonised = true`.
+
+Static vs dynamic grid-index reconciliation (MAR-009A, Section 6)
+--------------------------------------------------------------------
+A support node's `(grid_i, grid_j)` is identified from a PRODUCT'S OWN
+STATIC dataset. Reusing those same integer indices directly against a
+DIFFERENT (dynamic) xarray Dataset object assumes the two datasets share
+an identical local array origin/order merely because they represent the
+same underlying model grid -- an assumption this module never makes.
+`reconcile_node_grid_indices` re-resolves each node's canonical
+longitude/latitude against the ACTUAL dynamic dataset's own coordinate
+arrays before every dynamic sampling operation, and refuses to guess (skips
+the node, flagged) if no sufficiently close cell exists there.
 
 No bed shear stress, Shields parameter, sediment mobility, wave orbital
 velocity, erosion/deposition, scour, free-span, or risk scoring is
@@ -171,6 +190,84 @@ def build_support_node_table(
     return pd.DataFrame(records)
 
 
+# --- Static/dynamic grid reconciliation (MAR-009A, Section 6) ---------------
+
+# Project data-QA heuristic, not a physical constant: how close (as a
+# fraction of the coordinate array's own median spacing) a node's canonical
+# longitude/latitude must land to a dynamic dataset's own grid cell to be
+# treated as "the same real cell" rather than an unreconcilable mismatch.
+GRID_RECONCILIATION_TOLERANCE_FRACTION = 0.1
+
+
+def check_depth_coordinate_alignment(
+    static_depth_m: np.ndarray, dynamic_depth_m: np.ndarray
+) -> bool:
+    """Whether a static dataset's depth coordinate exactly matches a dynamic one's.
+
+    Only an EXACT match (same length, same values) is treated as
+    "alignable" -- never guessed at (Section 3). When this is False, the
+    static mask must not be used as an eligibility condition; the
+    bathymetry-depth constraint alone still applies.
+    """
+
+    static_depth_m = np.asarray(static_depth_m)
+    dynamic_depth_m = np.asarray(dynamic_depth_m)
+    if static_depth_m.shape != dynamic_depth_m.shape:
+        return False
+    return bool(np.array_equal(static_depth_m, dynamic_depth_m))
+
+
+def reconcile_node_grid_indices(
+    node: SupportNode,
+    dynamic_longitude: np.ndarray,
+    dynamic_latitude: np.ndarray,
+    *,
+    tolerance_fraction: float = GRID_RECONCILIATION_TOLERANCE_FRACTION,
+) -> tuple[int, int] | None:
+    """Re-resolve a node's canonical lon/lat against a DIFFERENT dataset's own grid.
+
+    Never reuses the node's own `(grid_i, grid_j)` (identified from
+    whichever dataset the node itself came from) against an unrelated
+    xarray Dataset object. Returns `None` -- never a guessed index -- if no
+    cell in `dynamic_longitude`/`dynamic_latitude` lands within
+    `tolerance_fraction` of that axis's own median grid spacing.
+    """
+
+    dynamic_longitude = np.asarray(dynamic_longitude)
+    dynamic_latitude = np.asarray(dynamic_latitude)
+
+    lon_idx = int(np.argmin(np.abs(dynamic_longitude - node.longitude)))
+    lat_idx = int(np.argmin(np.abs(dynamic_latitude - node.latitude)))
+
+    lon_spacing = (
+        float(np.median(np.abs(np.diff(np.sort(dynamic_longitude)))))
+        if len(dynamic_longitude) > 1
+        else 0.0
+    )
+    lat_spacing = (
+        float(np.median(np.abs(np.diff(np.sort(dynamic_latitude)))))
+        if len(dynamic_latitude) > 1
+        else 0.0
+    )
+
+    lon_diff = abs(float(dynamic_longitude[lon_idx]) - node.longitude)
+    lat_diff = abs(float(dynamic_latitude[lat_idx]) - node.latitude)
+
+    if lon_spacing and lon_diff > tolerance_fraction * lon_spacing:
+        return None
+    if lat_spacing and lat_diff > tolerance_fraction * lat_spacing:
+        return None
+    # Zero-length axes (a single-cell subset) have no spacing to compare
+    # against -- fall back to an exact-value check so a genuine mismatch
+    # is still caught rather than silently accepted.
+    if not lon_spacing and lon_diff > 0:
+        return None
+    if not lat_spacing and lat_diff > 0:
+        return None
+
+    return lon_idx, lat_idx
+
+
 # --- Time coordinate helpers --------------------------------------------------
 
 
@@ -195,6 +292,8 @@ PRIMARY_CURRENT_COLUMNS = (
     "height_above_model_bed_m",
     "height_above_model_bed_valid",
     "depth_level_index",
+    "below_bed_finite_candidate_count",
+    "max_below_bed_candidate_depth_m",
     "source_dataset",
     "temporal_role",
 )
@@ -205,30 +304,57 @@ def normalize_primary_current(
     *,
     nodes: list[SupportNode],
     model_bathymetry_by_node_id: dict[str, float],
+    static_mask_by_node_id: dict[str, np.ndarray] | None,
     source_dataset: str,
     evidence_role: str,
-) -> pd.DataFrame:
-    """Per (support node, hour): the deepest-valid-standard-level current only.
+) -> tuple[pd.DataFrame, list[str]]:
+    """Per (support node, hour): the deepest PHYSICALLY ELIGIBLE standard-level current only.
 
     Never duplicated across 941 chainage stations -- one row per real
-    support node per timestamp (Section 19).
+    support node per timestamp (Section 19). `static_mask_by_node_id` (keyed
+    by node_id, each value a mask array aligned to `current_ds["depth"]`) is
+    `None` when the static mask could not be unambiguously aligned to the
+    dynamic depth coordinate (Section 3) -- the bathymetry-depth
+    constraint alone still applies in that case.
+
+    Each node's `(grid_i, grid_j)` is re-resolved against `current_ds`'s
+    OWN longitude/latitude before sampling (MAR-009A, Section 6) -- never
+    the static dataset's indices reused blindly. A node whose coordinate
+    cannot be reconciled within tolerance is skipped entirely and returned
+    in the second tuple element, never silently sampled from the wrong
+    cell.
     """
 
     if not nodes:
-        return pd.DataFrame(columns=list(PRIMARY_CURRENT_COLUMNS))
+        return pd.DataFrame(columns=list(PRIMARY_CURRENT_COLUMNS)), []
 
     depths_m = current_ds["depth"].to_numpy()
+    dynamic_longitude = current_ds["longitude"].to_numpy()
+    dynamic_latitude = current_ds["latitude"].to_numpy()
     times = _to_utc_timestamps(current_ds["time"].to_numpy())
+    static_mask_by_node_id = static_mask_by_node_id or {}
 
     records: list[dict[str, Any]] = []
+    unreconciled_node_ids: list[str] = []
     for node in nodes:
-        uo_node = current_ds["uo"].isel(latitude=node.grid_j, longitude=node.grid_i).to_numpy()
-        vo_node = current_ds["vo"].isel(latitude=node.grid_j, longitude=node.grid_i).to_numpy()
+        resolved = reconcile_node_grid_indices(node, dynamic_longitude, dynamic_latitude)
+        if resolved is None:
+            unreconciled_node_ids.append(node.node_id)
+            continue
+        dyn_lon_idx, dyn_lat_idx = resolved
+
+        uo_node = current_ds["uo"].isel(latitude=dyn_lat_idx, longitude=dyn_lon_idx).to_numpy()
+        vo_node = current_ds["vo"].isel(latitude=dyn_lat_idx, longitude=dyn_lon_idx).to_numpy()
         model_bathymetry_m = model_bathymetry_by_node_id.get(node.node_id)
+        mask_at_depths = static_mask_by_node_id.get(node.node_id)
 
         for t_index, time_value in enumerate(times):
             selection = current_module.select_deepest_valid_standard_level(
-                depths_m, uo_node[t_index], vo_node[t_index]
+                depths_m,
+                uo_node[t_index],
+                vo_node[t_index],
+                model_bathymetry_m=model_bathymetry_m,
+                mask_at_depths=mask_at_depths,
             )
             height_m, height_valid = current_module.compute_height_above_model_bed_m(
                 model_bathymetry_m, selection.depth_m
@@ -259,12 +385,48 @@ def normalize_primary_current(
                     "height_above_model_bed_m": height_m,
                     "height_above_model_bed_valid": height_valid,
                     "depth_level_index": selection.depth_index,
+                    "below_bed_finite_candidate_count": selection.below_bed_finite_candidate_count,
+                    "max_below_bed_candidate_depth_m": selection.max_below_bed_candidate_depth_m,
                     "source_dataset": source_dataset,
                     "temporal_role": evidence_role,
                 }
             )
 
-    return pd.DataFrame(records, columns=list(PRIMARY_CURRENT_COLUMNS))
+    return pd.DataFrame(records, columns=list(PRIMARY_CURRENT_COLUMNS)), unreconciled_node_ids
+
+
+def compute_below_bed_diagnostics(primary_current_df: pd.DataFrame) -> pd.DataFrame:
+    """Per current_node_id: how many below-bed finite candidates were excluded, and when.
+
+    QA diagnostics only (Section 4) -- these never enter the canonical
+    forcing statistics; they only explain what the physical eligibility
+    filter removed.
+    """
+
+    columns = (
+        "current_node_id",
+        "below_model_bed_finite_candidate_count",
+        "timestamps_with_below_bed_finite_candidates",
+        "max_below_bed_candidate_depth_m",
+    )
+    if primary_current_df.empty:
+        return pd.DataFrame(columns=list(columns))
+
+    records = []
+    for node_id, group in primary_current_df.groupby("current_node_id"):
+        counts = group["below_bed_finite_candidate_count"].fillna(0)
+        max_depths = group["max_below_bed_candidate_depth_m"].dropna()
+        records.append(
+            {
+                "current_node_id": node_id,
+                "below_model_bed_finite_candidate_count": int(counts.sum()),
+                "timestamps_with_below_bed_finite_candidates": int((counts > 0).sum()),
+                "max_below_bed_candidate_depth_m": float(max_depths.max())
+                if len(max_depths)
+                else None,
+            }
+        )
+    return pd.DataFrame(records, columns=list(columns))
 
 
 # --- Long-term surface current normalization (Sections 11, 20) --------------
@@ -283,17 +445,33 @@ LONG_TERM_SURFACE_CURRENT_COLUMNS = (
 
 def normalize_long_term_surface_current(
     current_ds: xr.Dataset, *, nodes: list[SupportNode], source_dataset: str, evidence_role: str
-) -> pd.DataFrame:
-    """Per (long-term support node, hour): 2D surface current only -- context, never bottom."""
+) -> tuple[pd.DataFrame, list[str]]:
+    """Per (long-term support node, hour): 2D surface current only -- context, never bottom.
+
+    `nodes` must already be filtered to chainage-used nodes only (MAR-009A,
+    Section 7) -- this function does not itself filter by usage. Each
+    node's grid indices are re-resolved against `current_ds`'s own
+    coordinate arrays before sampling (Section 6); an unreconcilable node
+    is skipped and returned in the second tuple element.
+    """
 
     if not nodes:
-        return pd.DataFrame(columns=list(LONG_TERM_SURFACE_CURRENT_COLUMNS))
+        return pd.DataFrame(columns=list(LONG_TERM_SURFACE_CURRENT_COLUMNS)), []
 
+    dynamic_longitude = current_ds["longitude"].to_numpy()
+    dynamic_latitude = current_ds["latitude"].to_numpy()
     times = _to_utc_timestamps(current_ds["time"].to_numpy())
     records: list[dict[str, Any]] = []
+    unreconciled_node_ids: list[str] = []
     for node in nodes:
-        uo_node = current_ds["uo"].isel(latitude=node.grid_j, longitude=node.grid_i).to_numpy()
-        vo_node = current_ds["vo"].isel(latitude=node.grid_j, longitude=node.grid_i).to_numpy()
+        resolved = reconcile_node_grid_indices(node, dynamic_longitude, dynamic_latitude)
+        if resolved is None:
+            unreconciled_node_ids.append(node.node_id)
+            continue
+        dyn_lon_idx, dyn_lat_idx = resolved
+
+        uo_node = current_ds["uo"].isel(latitude=dyn_lat_idx, longitude=dyn_lon_idx).to_numpy()
+        vo_node = current_ds["vo"].isel(latitude=dyn_lat_idx, longitude=dyn_lon_idx).to_numpy()
         speed = current_module.compute_current_speed_m_s(uo_node, vo_node)
         direction_to = current_module.compute_current_direction_to_deg(uo_node, vo_node)
 
@@ -314,7 +492,9 @@ def normalize_long_term_surface_current(
                 }
             )
 
-    return pd.DataFrame(records, columns=list(LONG_TERM_SURFACE_CURRENT_COLUMNS))
+    return pd.DataFrame(
+        records, columns=list(LONG_TERM_SURFACE_CURRENT_COLUMNS)
+    ), unreconciled_node_ids
 
 
 # --- Wave normalization (Sections 12, 13, 22) --------------------------------
@@ -335,30 +515,47 @@ WAVE_COLUMNS = (
 )
 
 
-def _optional_variable(ds: xr.Dataset, name: str, node: SupportNode, length: int) -> np.ndarray:
+def _optional_variable(
+    ds: xr.Dataset, name: str, lat_idx: int, lon_idx: int, length: int
+) -> np.ndarray:
     if name not in ds.variables:
         return np.full(length, np.nan)
-    return ds[name].isel(latitude=node.grid_j, longitude=node.grid_i).to_numpy()
+    return ds[name].isel(latitude=lat_idx, longitude=lon_idx).to_numpy()
 
 
 def normalize_wave(
     wave_ds: xr.Dataset, *, nodes: list[SupportNode], source_dataset: str
-) -> pd.DataFrame:
-    """Per (wave support node, 3-hour step): Hs/Tp/Tm02/Tm10/direction, QA'd, never a bed force."""
+) -> tuple[pd.DataFrame, list[str]]:
+    """Per (wave support node, 3-hour step): Hs/Tp/Tm02/Tm10/direction, QA'd, never a bed force.
+
+    `nodes` must already be filtered to chainage-used nodes only (MAR-009A,
+    Section 7). Each node's grid indices are re-resolved against
+    `wave_ds`'s own coordinate arrays before sampling (Section 6); an
+    unreconcilable node is skipped and returned in the second tuple element.
+    """
 
     if not nodes:
-        return pd.DataFrame(columns=list(WAVE_COLUMNS))
+        return pd.DataFrame(columns=list(WAVE_COLUMNS)), []
 
+    dynamic_longitude = wave_ds["longitude"].to_numpy()
+    dynamic_latitude = wave_ds["latitude"].to_numpy()
     times = _to_utc_timestamps(wave_ds["time"].to_numpy())
     records: list[dict[str, Any]] = []
+    unreconciled_node_ids: list[str] = []
     for node in nodes:
-        hs = _optional_variable(wave_ds, "VHM0", node, len(times))
-        tp = _optional_variable(wave_ds, "VTPK", node, len(times))
-        tm02 = _optional_variable(wave_ds, "VTM02", node, len(times))
-        tm10 = _optional_variable(wave_ds, "VTM10", node, len(times))
-        vmdr = _optional_variable(wave_ds, "VMDR", node, len(times))
-        stokes_u = _optional_variable(wave_ds, "VSDX", node, len(times))
-        stokes_v = _optional_variable(wave_ds, "VSDY", node, len(times))
+        resolved = reconcile_node_grid_indices(node, dynamic_longitude, dynamic_latitude)
+        if resolved is None:
+            unreconciled_node_ids.append(node.node_id)
+            continue
+        dyn_lon_idx, dyn_lat_idx = resolved
+
+        hs = _optional_variable(wave_ds, "VHM0", dyn_lat_idx, dyn_lon_idx, len(times))
+        tp = _optional_variable(wave_ds, "VTPK", dyn_lat_idx, dyn_lon_idx, len(times))
+        tm02 = _optional_variable(wave_ds, "VTM02", dyn_lat_idx, dyn_lon_idx, len(times))
+        tm10 = _optional_variable(wave_ds, "VTM10", dyn_lat_idx, dyn_lon_idx, len(times))
+        vmdr = _optional_variable(wave_ds, "VMDR", dyn_lat_idx, dyn_lon_idx, len(times))
+        stokes_u = _optional_variable(wave_ds, "VSDX", dyn_lat_idx, dyn_lon_idx, len(times))
+        stokes_v = _optional_variable(wave_ds, "VSDY", dyn_lat_idx, dyn_lon_idx, len(times))
 
         hs_valid_mask = wave_module.validate_significant_wave_height(hs)
         direction_from = wave_module.normalize_direction_deg(vmdr)
@@ -390,7 +587,7 @@ def normalize_wave(
                 }
             )
 
-    return pd.DataFrame(records, columns=list(WAVE_COLUMNS))
+    return pd.DataFrame(records, columns=list(WAVE_COLUMNS)), unreconciled_node_ids
 
 
 # --- Descriptive statistics (Sections 24, 25) --------------------------------
@@ -623,6 +820,73 @@ def compute_short_window_surface_context_ratio(
     return pd.DataFrame(records, columns=list(columns))
 
 
+def compute_primary_current_route_summary(primary_current_df: pd.DataFrame) -> dict[str, Any]:
+    """Route-wide (across all nodes/hours) primary-current integrity summary (Section 19).
+
+    `all_within_water_column` is the single required pass/fail statement:
+    True only if every row where a canonical current sample WAS selected
+    has `height_above_model_bed_valid == True` -- a row with no eligible
+    depth at all (nothing selected) is never counted as a violation.
+    """
+
+    empty = {
+        "model_bathymetry_m_min": None,
+        "model_bathymetry_m_median": None,
+        "model_bathymetry_m_max": None,
+        "current_sample_depth_m_min": None,
+        "current_sample_depth_m_median": None,
+        "current_sample_depth_m_max": None,
+        "height_above_model_bed_m_min": None,
+        "height_above_model_bed_m_median": None,
+        "height_above_model_bed_m_p95": None,
+        "height_above_model_bed_m_max": None,
+        "all_within_water_column": None,
+    }
+    if primary_current_df.empty:
+        return empty
+
+    bathymetry = primary_current_df["model_bathymetry_m"].dropna()
+    depth = primary_current_df["current_sample_depth_m"].dropna()
+    height = primary_current_df["height_above_model_bed_m"].dropna()
+    all_within = bool(primary_current_df["height_above_model_bed_valid"].fillna(True).all())
+
+    return {
+        "model_bathymetry_m_min": float(bathymetry.min()) if len(bathymetry) else None,
+        "model_bathymetry_m_median": float(bathymetry.median()) if len(bathymetry) else None,
+        "model_bathymetry_m_max": float(bathymetry.max()) if len(bathymetry) else None,
+        "current_sample_depth_m_min": float(depth.min()) if len(depth) else None,
+        "current_sample_depth_m_median": float(depth.median()) if len(depth) else None,
+        "current_sample_depth_m_max": float(depth.max()) if len(depth) else None,
+        "height_above_model_bed_m_min": float(height.min()) if len(height) else None,
+        "height_above_model_bed_m_median": float(height.median()) if len(height) else None,
+        "height_above_model_bed_m_p95": float(height.quantile(0.95)) if len(height) else None,
+        "height_above_model_bed_m_max": float(height.max()) if len(height) else None,
+        "all_within_water_column": all_within,
+    }
+
+
+def compute_distance_diagnostics(mapping_df: pd.DataFrame) -> dict[str, float | None]:
+    """min/median/p95/max station-to-node distance (m) across all chainage stations.
+
+    A spatial-support diagnostic only (Section 10) -- never converted into
+    a confidence score. `mapping_df` is the per-station nearest-node
+    mapping (one row per chainage station, as returned by
+    `map_points_to_nearest_node`), not the support-node table.
+    """
+
+    if "distance_m" not in mapping_df.columns:
+        return {"min_m": None, "median_m": None, "p95_m": None, "max_m": None}
+    distances = pd.to_numeric(mapping_df["distance_m"], errors="coerce").dropna()
+    if distances.empty:
+        return {"min_m": None, "median_m": None, "p95_m": None, "max_m": None}
+    return {
+        "min_m": float(distances.min()),
+        "median_m": float(distances.median()),
+        "p95_m": float(distances.quantile(0.95)),
+        "max_m": float(distances.max()),
+    }
+
+
 # --- Chainage evidence assembly (Section 23) ---------------------------------
 
 CHAINAGE_METOCEAN_COLUMNS = (
@@ -803,47 +1067,108 @@ def write_metocean_evidence_metadata(*, metadata: dict[str, Any], output_path: P
 # --- Report printing (Section 37) --------------------------------------------
 
 
+def _fmt(value: Any, spec: str = ".3f") -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return format(value, spec)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def print_metocean_evidence_report(
     *,
     primary_current_stats: pd.DataFrame,
+    primary_current_route_summary: dict[str, Any],
+    below_bed_diagnostics: pd.DataFrame,
+    primary_distance_diagnostics: dict[str, float | None],
     long_term_stats: pd.DataFrame,
-    wave_stats: pd.DataFrame,
+    long_term_distance_diagnostics: dict[str, float | None],
     short_window_ratios: pd.DataFrame,
+    wave_stats: pd.DataFrame,
+    wave_distance_diagnostics: dict[str, float | None],
     primary_current_actual_start: datetime | None,
     primary_current_actual_end: datetime | None,
     long_term_actual_start: datetime | None,
     long_term_actual_end: datetime | None,
     wave_actual_start: datetime | None,
     wave_actual_end: datetime | None,
+    old_vs_new_comparison: dict[str, Any] | None = None,
     file: Any = None,
 ) -> None:
     file = file or sys.stdout
-    lines = ["=== PL854 Metocean Forcing Evidence Base (MAR-009) ===", ""]
+    lines = ["=== PL854 Metocean Forcing Evidence Base (MAR-009/MAR-009A) ===", ""]
 
-    lines.append("## Primary current")
+    # --- Primary current integrity (Section 19) -----------------------------
+    lines.append("## Primary current integrity")
+    lines.append(f"  Route-used support node count: {len(primary_current_stats)}")
     lines.append(
         f"  Actual interval: {primary_current_actual_start} .. {primary_current_actual_end}"
     )
-    lines.append(f"  Support nodes: {len(primary_current_stats)}")
+    summary = primary_current_route_summary
+    lines.append(
+        "  Model bathymetry (m): min="
+        f"{_fmt(summary['model_bathymetry_m_min'])} "
+        f"median={_fmt(summary['model_bathymetry_m_median'])} "
+        f"max={_fmt(summary['model_bathymetry_m_max'])}"
+    )
+    lines.append(
+        "  Selected current depth (m): min="
+        f"{_fmt(summary['current_sample_depth_m_min'])} "
+        f"median={_fmt(summary['current_sample_depth_m_median'])} "
+        f"max={_fmt(summary['current_sample_depth_m_max'])}"
+    )
+    lines.append(
+        "  Height above model bed (m): min="
+        f"{_fmt(summary['height_above_model_bed_m_min'])} "
+        f"median={_fmt(summary['height_above_model_bed_m_median'])} "
+        f"p95={_fmt(summary['height_above_model_bed_m_p95'])} "
+        f"max={_fmt(summary['height_above_model_bed_m_max'])}"
+    )
+    if not below_bed_diagnostics.empty:
+        lines.append(
+            "  Below-bed finite candidates excluded: "
+            f"{int(below_bed_diagnostics['below_model_bed_finite_candidate_count'].sum())} "
+            f"(timestamps affected: "
+            f"{int(below_bed_diagnostics['timestamps_with_below_bed_finite_candidates'].sum())}, "
+            "max below-bed candidate depth: "
+            f"{_fmt(below_bed_diagnostics['max_below_bed_candidate_depth_m'].max())} m)"
+        )
     if not primary_current_stats.empty:
         lines.append(
-            "  Speed (m/s) across nodes: mean="
+            "  Current speed (m/s) across nodes: mean="
             f"{primary_current_stats['current_speed_mean_m_s'].mean():.3f} "
             f"p95={primary_current_stats['current_speed_p95_m_s'].max():.3f} "
             f"p99={primary_current_stats['current_speed_p99_m_s'].max():.3f} "
             f"max={primary_current_stats['current_speed_max_m_s'].max():.3f}"
         )
         lines.append(
-            "  Representative sample depth (m): "
-            f"min={primary_current_stats['representative_sample_depth_m'].min()} "
-            f"max={primary_current_stats['representative_sample_depth_m'].max()}"
+            "  Completeness %: min="
+            f"{_fmt(primary_current_stats['completeness_pct'].min(), '.1f')} "
+            f"median={_fmt(primary_current_stats['completeness_pct'].median(), '.1f')}"
         )
-    lines.append("  NOT NATIVE BOTTOM-CELL CURRENT -- deepest valid standard level only.")
+    lines.append(
+        "  Station-to-node distance (m): min="
+        f"{_fmt(primary_distance_diagnostics['min_m'])} "
+        f"median={_fmt(primary_distance_diagnostics['median_m'])} "
+        f"p95={_fmt(primary_distance_diagnostics['p95_m'])} "
+        f"max={_fmt(primary_distance_diagnostics['max_m'])}"
+    )
+    lines.append(
+        "  NOT NATIVE BOTTOM-CELL CURRENT -- deepest physically eligible standard level only."
+    )
+    if summary.get("all_within_water_column"):
+        lines.append("  ALL CANONICAL CURRENT SAMPLES ARE WITHIN THE COPERNICUS MODEL WATER COLUMN")
+    elif summary.get("all_within_water_column") is False:
+        lines.append(
+            "  FAILURE: one or more canonical current samples are below the model water column"
+        )
     lines.append("")
 
+    # --- Long-term surface current (Section 19) -----------------------------
     lines.append("## Long-term surface current")
+    lines.append(f"  Route-used support nodes: {len(long_term_stats)}")
     lines.append(f"  Actual interval: {long_term_actual_start} .. {long_term_actual_end}")
-    lines.append(f"  Support nodes: {len(long_term_stats)}")
     if not long_term_stats.empty:
         lines.append(
             "  Surface speed (m/s): "
@@ -851,6 +1176,13 @@ def print_metocean_evidence_report(
             f"p99={long_term_stats['surface_current_speed_p99_m_s'].max():.3f} "
             f"max={long_term_stats['surface_current_speed_max_m_s'].max():.3f}"
         )
+    lines.append(
+        "  Station-to-node distance (m): min="
+        f"{_fmt(long_term_distance_diagnostics['min_m'])} "
+        f"median={_fmt(long_term_distance_diagnostics['median_m'])} "
+        f"p95={_fmt(long_term_distance_diagnostics['p95_m'])} "
+        f"max={_fmt(long_term_distance_diagnostics['max_m'])}"
+    )
     if not short_window_ratios.empty:
         lines.append(
             "  short_window_surface_context_ratio (p95): "
@@ -859,9 +1191,10 @@ def print_metocean_evidence_report(
     lines.append("  SURFACE CURRENT CONTEXT ONLY.")
     lines.append("")
 
+    # --- Waves (Section 19) -------------------------------------------------
     lines.append("## Waves")
+    lines.append(f"  Route-used support nodes: {len(wave_stats)}")
     lines.append(f"  Actual interval: {wave_actual_start} .. {wave_actual_end}")
-    lines.append(f"  Support nodes: {len(wave_stats)}")
     if not wave_stats.empty:
         lines.append(
             "  Hs (m): mean="
@@ -872,7 +1205,27 @@ def print_metocean_evidence_report(
             f"  Tp (s): median={wave_stats['tp_median_s'].median():.3f} "
             f"p95={wave_stats['tp_p95_s'].max():.3f}"
         )
+        lines.append(
+            "  Completeness %: min="
+            f"{_fmt(wave_stats['completeness_pct'].min(), '.1f')} "
+            f"median={_fmt(wave_stats['completeness_pct'].median(), '.1f')}"
+        )
+    lines.append(
+        "  Station-to-node distance (m): min="
+        f"{_fmt(wave_distance_diagnostics['min_m'])} "
+        f"median={_fmt(wave_distance_diagnostics['median_m'])} "
+        f"p95={_fmt(wave_distance_diagnostics['p95_m'])} "
+        f"max={_fmt(wave_distance_diagnostics['max_m'])}"
+    )
     lines.append("")
+
+    # --- Old-vs-corrected comparison (Sections 12, 13, 19) -------------------
+    if old_vs_new_comparison:
+        lines.append("## Old-vs-corrected comparison")
+        for label, (old_value, new_value) in old_vs_new_comparison.items():
+            changed = "CHANGED" if old_value != new_value else "unchanged"
+            lines.append(f"  {label}: old={_fmt(old_value)} -> new={_fmt(new_value)} ({changed})")
+        lines.append("")
 
     lines.append(
         "No bed shear stress, Shields parameter, sediment mobility, or risk scoring computed."

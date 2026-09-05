@@ -4,6 +4,7 @@ import argparse
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import geopandas as gpd
 import numpy as np
@@ -803,6 +804,19 @@ def _cmd_build_sediment_evidence(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_existing_parquet(path: Path) -> pd.DataFrame:
+    """The prior run's canonical output, or an empty frame if there isn't one yet.
+
+    Read BEFORE that same path is overwritten, so the old-vs-corrected
+    comparison (MAR-009A Sections 12, 13, 19) reflects what was actually on
+    disk rather than a fabricated baseline.
+    """
+
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
 def _mask_surface_slice(mask: xr.DataArray) -> xr.DataArray:
     """The surface-level slice of a mask variable that may or may not have a depth dimension."""
 
@@ -1128,6 +1142,34 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
         evidence_role=copernicus.PRIMARY_CURRENT_EVIDENCE_ROLE,
     )
 
+    # Only chainage-USED nodes are ever normalized into a time series
+    # (MAR-009A, Section 7) -- never every wet cell in the request bbox.
+    used_primary_nodes = [n for n in primary_nodes if n.node_id in primary_bathymetry_by_node]
+    used_long_term_node_ids = set(long_term_mapping["node_id"].dropna())
+    used_long_term_nodes = [n for n in long_term_nodes if n.node_id in used_long_term_node_ids]
+    used_wave_node_ids = set(wave_mapping["node_id"].dropna())
+    used_wave_nodes = [n for n in wave_nodes if n.node_id in used_wave_node_ids]
+
+    # --- capture OLD canonical outputs for the old-vs-corrected comparison
+    # (Sections 12, 13, 19) -- read BEFORE anything is overwritten below.
+    old_primary_current_df = _read_existing_parquet(
+        metocean_interim_dir / "current_primary_hourly.parquet"
+    )
+    old_current_stats = (
+        metocean_evidence.compute_current_node_statistics(old_primary_current_df)
+        if not old_primary_current_df.empty
+        else pd.DataFrame()
+    )
+    # The node-count regression this ticket fixes (Section 7/8) shows up in
+    # the TIME SERIES files (every wet bbox cell was normalized), not the
+    # support-node table (already correctly used-only via
+    # `build_support_node_table`) -- so the OLD comparison baseline must be
+    # read from the same hourly/3-hourly files, not the node table.
+    old_wave_df = _read_existing_parquet(metocean_interim_dir / "wave_3hourly.parquet")
+    old_long_term_current_df = _read_existing_parquet(
+        metocean_interim_dir / "current_long_term_surface_hourly.parquet"
+    )
+
     # --- primary current acquisition (Section 6, 15) ---------------------
     primary_chunk_ranges = metocean_acquisition.generate_monthly_chunks(
         # The rolling analysis/forecast catalogue's own available start is
@@ -1150,15 +1192,48 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
         temporal_resolution="hourly_instantaneous",
     )
 
+    static_depth_mask_used = False
+    static_mask_by_node_id: dict[str, np.ndarray] | None = None
+    unreconciled_primary_node_ids: list[str] = []
     primary_current_df = pd.DataFrame()
     if primary_current_ds is not None:
-        primary_current_df = metocean_evidence.normalize_primary_current(
-            primary_current_ds,
-            nodes=[n for n in primary_nodes if n.node_id in primary_bathymetry_by_node],
-            model_bathymetry_by_node_id=primary_bathymetry_by_node,
-            source_dataset=primary_current_dataset_id,
-            evidence_role=copernicus.PRIMARY_CURRENT_EVIDENCE_ROLE,
+        static_depth_mask_used = "depth" in primary_static_ds.coords and (
+            metocean_evidence.check_depth_coordinate_alignment(
+                primary_static_ds["depth"].to_numpy(), primary_current_ds["depth"].to_numpy()
+            )
         )
+        if static_depth_mask_used:
+            static_mask_by_node_id = {
+                node.node_id: primary_static_ds["mask"]
+                .isel(latitude=node.grid_j, longitude=node.grid_i)
+                .to_numpy()
+                for node in used_primary_nodes
+            }
+        else:
+            print(
+                "warning: static mask depth coordinate does not align with the dynamic "
+                "current dataset's own depth coordinate -- proceeding with the bathymetry-"
+                "depth eligibility constraint alone (Section 3); static_depth_mask_used=False",
+                file=sys.stderr,
+            )
+
+        primary_current_df, unreconciled_primary_node_ids = (
+            metocean_evidence.normalize_primary_current(
+                primary_current_ds,
+                nodes=used_primary_nodes,
+                model_bathymetry_by_node_id=primary_bathymetry_by_node,
+                static_mask_by_node_id=static_mask_by_node_id,
+                source_dataset=primary_current_dataset_id,
+                evidence_role=copernicus.PRIMARY_CURRENT_EVIDENCE_ROLE,
+            )
+        )
+        if unreconciled_primary_node_ids:
+            print(
+                f"warning: {len(unreconciled_primary_node_ids)} primary current support "
+                "node(s) could not be reconciled against the dynamic dataset grid and were "
+                f"excluded from normalization: {unreconciled_primary_node_ids}",
+                file=sys.stderr,
+            )
 
     # --- long-term surface current acquisition (Sections 11, 31) ---------
     long_term_start_ms = copernicus.get_dataset_time_range_ms(long_term_current_dataset_id)
@@ -1178,14 +1253,24 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
         temporal_resolution="hourly_instantaneous",
     )
 
+    unreconciled_long_term_node_ids: list[str] = []
     long_term_current_df = pd.DataFrame()
     if long_term_current_ds is not None:
-        long_term_current_df = metocean_evidence.normalize_long_term_surface_current(
-            long_term_current_ds,
-            nodes=long_term_nodes,
-            source_dataset=long_term_current_dataset_id,
-            evidence_role=copernicus.LONG_TERM_SURFACE_CURRENT_CONTEXT_ROLE,
+        long_term_current_df, unreconciled_long_term_node_ids = (
+            metocean_evidence.normalize_long_term_surface_current(
+                long_term_current_ds,
+                nodes=used_long_term_nodes,
+                source_dataset=long_term_current_dataset_id,
+                evidence_role=copernicus.LONG_TERM_SURFACE_CURRENT_CONTEXT_ROLE,
+            )
         )
+        if unreconciled_long_term_node_ids:
+            print(
+                f"warning: {len(unreconciled_long_term_node_ids)} long-term surface current "
+                "support node(s) could not be reconciled against the dynamic dataset grid and "
+                f"were excluded from normalization: {unreconciled_long_term_node_ids}",
+                file=sys.stderr,
+            )
 
     # --- wave reanalysis acquisition (Section 12) -------------------------
     wave_start_ms = copernicus.get_dataset_time_range_ms(wave_dataset_id)
@@ -1205,11 +1290,19 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
         temporal_resolution="3hourly_instantaneous",
     )
 
+    unreconciled_wave_node_ids: list[str] = []
     wave_df = pd.DataFrame()
     if wave_ds is not None:
-        wave_df = metocean_evidence.normalize_wave(
-            wave_ds, nodes=wave_nodes, source_dataset=wave_dataset_id
+        wave_df, unreconciled_wave_node_ids = metocean_evidence.normalize_wave(
+            wave_ds, nodes=used_wave_nodes, source_dataset=wave_dataset_id
         )
+        if unreconciled_wave_node_ids:
+            print(
+                f"warning: {len(unreconciled_wave_node_ids)} wave support node(s) could not "
+                "be reconciled against the dynamic dataset grid and were excluded from "
+                f"normalization: {unreconciled_wave_node_ids}",
+                file=sys.stderr,
+            )
 
     # --- descriptive statistics (Sections 24, 25, 27) ---------------------
     current_stats = metocean_evidence.compute_current_node_statistics(primary_current_df)
@@ -1224,6 +1317,17 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
     short_window_ratios = metocean_evidence.compute_short_window_surface_context_ratio(
         long_term_current_df, primary_start, primary_end
     )
+
+    # --- new integrity diagnostics (MAR-009A, Sections 4, 9, 10) ----------
+    below_bed_diagnostics = metocean_evidence.compute_below_bed_diagnostics(primary_current_df)
+    primary_current_route_summary = metocean_evidence.compute_primary_current_route_summary(
+        primary_current_df
+    )
+    primary_distance_diagnostics = metocean_evidence.compute_distance_diagnostics(primary_mapping)
+    long_term_distance_diagnostics = metocean_evidence.compute_distance_diagnostics(
+        long_term_mapping
+    )
+    wave_distance_diagnostics = metocean_evidence.compute_distance_diagnostics(wave_mapping)
 
     long_term_node_table = metocean_evidence.build_support_node_table(
         long_term_nodes,
@@ -1326,6 +1430,55 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
             "support_node_mapping_method": "nearest wet model grid cell (no bilinear "
             "interpolation of data or masks)",
             "canonical_model_bathymetry_vertical_datums_not_harmonised": True,
+            "dynamic_grid_coordinate_reconciliation_method": (
+                "each support node's canonical lon/lat is re-resolved against the dynamic "
+                "dataset's own coordinate arrays (nearest cell, refused beyond "
+                f"{metocean_evidence.GRID_RECONCILIATION_TOLERANCE_FRACTION:.0%} of that "
+                "axis's median grid spacing) -- static dataset grid indices are never reused "
+                "directly against a dynamic dataset (MAR-009A Section 6)"
+            ),
+            "static_dynamic_coordinate_match_status": {
+                "primary_current": (
+                    "all_used_nodes_reconciled"
+                    if not unreconciled_primary_node_ids
+                    else f"{len(unreconciled_primary_node_ids)}_node(s)_unreconciled"
+                ),
+                "long_term_surface_current": (
+                    "all_used_nodes_reconciled"
+                    if not unreconciled_long_term_node_ids
+                    else f"{len(unreconciled_long_term_node_ids)}_node(s)_unreconciled"
+                ),
+                "wave": (
+                    "all_used_nodes_reconciled"
+                    if not unreconciled_wave_node_ids
+                    else f"{len(unreconciled_wave_node_ids)}_node(s)_unreconciled"
+                ),
+            },
+            "primary_current_vertical_eligibility_rule": (
+                "a standard depth is only eligible when uo AND vo are finite AND "
+                "depth_m <= model_bathymetry_m + tolerance AND, where the static mask's depth "
+                "coordinate is alignable, the mask cell is wet (MAR-009A Sections 2-3)"
+            ),
+            "static_depth_mask_used": static_depth_mask_used,
+            "below_bed_finite_value_diagnostic_summary": {
+                "below_model_bed_finite_candidate_count": (
+                    int(below_bed_diagnostics["below_model_bed_finite_candidate_count"].sum())
+                    if not below_bed_diagnostics.empty
+                    else 0
+                ),
+                "timestamps_with_below_bed_finite_candidates": (
+                    int(below_bed_diagnostics["timestamps_with_below_bed_finite_candidates"].sum())
+                    if not below_bed_diagnostics.empty
+                    else 0
+                ),
+                "max_below_bed_candidate_depth_m": (
+                    float(below_bed_diagnostics["max_below_bed_candidate_depth_m"].max())
+                    if not below_bed_diagnostics.empty
+                    and below_bed_diagnostics["max_below_bed_candidate_depth_m"].notna().any()
+                    else None
+                ),
+            },
+            "only_chainage_used_support_nodes_normalized": True,
             "raw_acquisition_manifest_path": str(manifest_path),
             "limitations": [
                 "primary current record is only the rolling available historical analysis "
@@ -1360,11 +1513,66 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
     print(f"Chainage metocean evidence: {len(chainage_metocean_df)} station(s) -> {chainage_path}")
     print(f"Metadata: {metadata_path}")
     print()
+
+    # --- old-vs-corrected comparison (Sections 12, 13, 19) ----------------
+    # `old_*` values were read from the ON-DISK canonical outputs BEFORE this
+    # run overwrote them; a run against an empty/absent prior output simply
+    # reports `old=None` rather than fabricating a baseline.
+    old_vs_new_comparison: dict[str, tuple[Any, Any]] = {
+        "primary_current_speed_mean_m_s": (
+            float(old_current_stats["current_speed_mean_m_s"].mean())
+            if not old_current_stats.empty
+            else None,
+            float(current_stats["current_speed_mean_m_s"].mean())
+            if not current_stats.empty
+            else None,
+        ),
+        "primary_current_speed_p95_m_s": (
+            float(old_current_stats["current_speed_p95_m_s"].max())
+            if not old_current_stats.empty
+            else None,
+            float(current_stats["current_speed_p95_m_s"].max())
+            if not current_stats.empty
+            else None,
+        ),
+        "primary_current_speed_p99_m_s": (
+            float(old_current_stats["current_speed_p99_m_s"].max())
+            if not old_current_stats.empty
+            else None,
+            float(current_stats["current_speed_p99_m_s"].max())
+            if not current_stats.empty
+            else None,
+        ),
+        "primary_current_speed_max_m_s": (
+            float(old_current_stats["current_speed_max_m_s"].max())
+            if not old_current_stats.empty
+            else None,
+            float(current_stats["current_speed_max_m_s"].max())
+            if not current_stats.empty
+            else None,
+        ),
+        "wave_time_series_distinct_node_count": (
+            int(old_wave_df["wave_node_id"].nunique()) if not old_wave_df.empty else None,
+            len(wave_stats),
+        ),
+        "long_term_current_time_series_distinct_node_count": (
+            int(old_long_term_current_df["current_lt_node_id"].nunique())
+            if not old_long_term_current_df.empty
+            else None,
+            len(long_term_stats),
+        ),
+    }
+
     metocean_evidence.print_metocean_evidence_report(
         primary_current_stats=current_stats,
+        primary_current_route_summary=primary_current_route_summary,
+        below_bed_diagnostics=below_bed_diagnostics,
+        primary_distance_diagnostics=primary_distance_diagnostics,
         long_term_stats=long_term_stats,
-        wave_stats=wave_stats,
+        long_term_distance_diagnostics=long_term_distance_diagnostics,
         short_window_ratios=short_window_ratios,
+        wave_stats=wave_stats,
+        wave_distance_diagnostics=wave_distance_diagnostics,
         primary_current_actual_start=primary_start,
         primary_current_actual_end=primary_end,
         long_term_actual_start=long_term_current_df["time_utc"].min()
@@ -1375,6 +1583,7 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
         else None,
         wave_actual_start=wave_df["time_utc"].min() if not wave_df.empty else None,
         wave_actual_end=wave_df["time_utc"].max() if not wave_df.empty else None,
+        old_vs_new_comparison=old_vs_new_comparison,
     )
     return 0
 
