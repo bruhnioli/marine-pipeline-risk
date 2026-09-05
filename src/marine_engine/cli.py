@@ -2087,23 +2087,38 @@ def _cmd_build_wave_orbital_forcing(args: argparse.Namespace) -> int:
     wave_df = wave_df.copy()
     wave_df["model_bathymetry_m"] = wave_df["wave_node_id"].map(wave_bathymetry_by_node)
 
+    hourly_orbital_df = wave_orbital.build_wave_orbital_velocity_3hourly(wave_df)
+
+    # MAR-011A Section 7: a hard integrity failure, never a mere warning --
+    # duplicate/non-unique/non-monotonic (wave_node_id, time_utc) must stop
+    # the run, since MAR-009B's own canonical wave series is guaranteed
+    # temporally unique and any violation here indicates a real regression.
+    # Checked BEFORE stats/completeness so this specific, known failure mode
+    # is reported clearly rather than incidentally tripping the generic
+    # completeness invariant with a less specific message.
+    temporal_qa = metocean_evidence.validate_temporal_integrity(
+        hourly_orbital_df, time_column="time_utc", node_column="wave_node_id"
+    )
+    temporal_integrity_failed = (
+        bool(temporal_qa.get("duplicate_node_time_row_count"))
+        or temporal_qa.get("time_coordinate_unique") is False
+        or temporal_qa.get("time_coordinate_monotonic_increasing") is False
+    )
+    if temporal_integrity_failed:
+        print(
+            "error: wave orbital canonical time series failed a required temporal "
+            f"integrity check: {temporal_qa}",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
-        hourly_orbital_df = wave_orbital.build_wave_orbital_velocity_3hourly(wave_df)
         stats_df = wave_orbital.compute_wave_orbital_velocity_stats(hourly_orbital_df)
     except wave_orbital.OrbitalVelocityCompletenessError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     domain_summary = wave_orbital.compute_wave_orbital_domain_summary(hourly_orbital_df)
-    temporal_qa = metocean_evidence.validate_temporal_integrity(
-        hourly_orbital_df, time_column="time_utc", node_column="wave_node_id"
-    )
-    if temporal_qa.get("duplicate_node_time_row_count"):
-        print(
-            "warning: duplicate (wave_node_id, time_utc) rows detected in the canonical "
-            f"wave series: {temporal_qa['duplicate_node_time_row_count']}",
-            file=sys.stderr,
-        )
 
     # --- per-node reference attributes for segment/map assembly ------------
     stats_by_id = stats_df.set_index("wave_node_id")
@@ -2140,13 +2155,81 @@ def _cmd_build_wave_orbital_forcing(args: argparse.Namespace) -> int:
         chainage_wave_df.rename(columns={"wave_node_distance_m": "distance_m"})
     )
 
+    # --- capture OLD (pre-MAR-011A conditional) stats for comparison --------
+    # Read BEFORE anything is overwritten below (Section 9) -- the old
+    # `wave_orbital_velocity_stats.parquet` (if present) was computed under
+    # MAR-011's incorrect t<=0.54 gating, so its `orbital_rms_*` fields are
+    # the "old conditional" values being compared against here.
+    stats_output_path = metocean_processed_dir / "wave_orbital_velocity_stats.parquet"
+    old_stats_df = _read_existing_parquet(stats_output_path)
+
+    old_vs_new_comparison: dict[str, tuple[Any, Any]] = {
+        "orbital_rms_mean_m_s": (
+            float(old_stats_df["orbital_rms_mean_m_s"].mean()) if not old_stats_df.empty else None,
+            float(stats_df["orbital_rms_mean_m_s"].mean()) if not stats_df.empty else None,
+        ),
+        "orbital_rms_p95_m_s": (
+            float(old_stats_df["orbital_rms_p95_m_s"].max()) if not old_stats_df.empty else None,
+            float(stats_df["orbital_rms_p95_m_s"].max()) if not stats_df.empty else None,
+        ),
+        "orbital_rms_p99_m_s": (
+            float(old_stats_df["orbital_rms_p99_m_s"].max()) if not old_stats_df.empty else None,
+            float(stats_df["orbital_rms_p99_m_s"].max()) if not stats_df.empty else None,
+        ),
+        "orbital_rms_max_m_s": (
+            float(old_stats_df["orbital_rms_max_m_s"].max()) if not old_stats_df.empty else None,
+            float(stats_df["orbital_rms_max_m_s"].max()) if not stats_df.empty else None,
+        ),
+        "orbital_amplitude_p95_m_s": (
+            float(old_stats_df["orbital_amplitude_p95_m_s"].max())
+            if not old_stats_df.empty
+            else None,
+            float(stats_df["orbital_amplitude_p95_m_s"].max()) if not stats_df.empty else None,
+        ),
+        "orbital_amplitude_p99_m_s": (
+            float(old_stats_df["orbital_amplitude_p99_m_s"].max())
+            if not old_stats_df.empty
+            else None,
+            float(stats_df["orbital_amplitude_p99_m_s"].max()) if not stats_df.empty else None,
+        ),
+        "orbital_amplitude_max_m_s": (
+            float(old_stats_df["orbital_amplitude_max_m_s"].max())
+            if not old_stats_df.empty
+            else None,
+            float(stats_df["orbital_amplitude_max_m_s"].max()) if not stats_df.empty else None,
+        ),
+    }
+
+    old_vs_new_per_node = pd.DataFrame()
+    if not old_stats_df.empty and not stats_df.empty:
+        old_vs_new_per_node = old_stats_df[["wave_node_id", "orbital_rms_p95_m_s"]].merge(
+            stats_df[["wave_node_id", "orbital_rms_p95_m_s"]],
+            on="wave_node_id",
+            how="outer",
+            suffixes=("_old", "_new"),
+        )
+        old_vs_new_per_node = old_vs_new_per_node.rename(
+            columns={
+                "orbital_rms_p95_m_s_old": "old_p95_m_s",
+                "orbital_rms_p95_m_s_new": "new_p95_m_s",
+            }
+        )
+        old_vs_new_per_node["abs_diff_m_s"] = (
+            old_vs_new_per_node["new_p95_m_s"] - old_vs_new_per_node["old_p95_m_s"]
+        )
+        old_vs_new_per_node["pct_diff_pct"] = np.where(
+            old_vs_new_per_node["old_p95_m_s"].notna() & (old_vs_new_per_node["old_p95_m_s"] != 0),
+            100.0
+            * old_vs_new_per_node["abs_diff_m_s"]
+            / old_vs_new_per_node["old_p95_m_s"].replace(0, np.nan),
+            np.nan,
+        )
+
     # --- write parquet/gpkg outputs ------------------------------------------
     hourly_path = metocean_evidence.write_parquet(
         hourly_orbital_df, metocean_interim_dir / "wave_orbital_velocity_3hourly.parquet"
     )
-    stats_path = metocean_evidence.write_parquet(
-        stats_df, metocean_processed_dir / "wave_orbital_velocity_stats.parquet"
-    )
+    stats_path = metocean_evidence.write_parquet(stats_df, stats_output_path)
     segments_path = wave_orbital_map.write_wave_orbital_reference_segments_gpkg(
         segments_gdf, metocean_processed_dir / "wave_orbital_reference_segments.gpkg"
     )
@@ -2181,8 +2264,13 @@ def _cmd_build_wave_orbital_forcing(args: argparse.Namespace) -> int:
             "equivalent_amplitude = sqrt(2)*Urms; "
             "equivalent_peak_period = 1.28*Tz"
         ),
-        "calibration_domain": f"0 <= sqrt(h/g)/Tz <= {wave_orbital.CALIBRATION_DOMAIN_MAX_T}",
-        "calibration_domain_semantics": ("METHOD_ACCURACY_DOMAIN_NOT_UNIVERSAL_PHYSICAL_THRESHOLD"),
+        "reported_better_than_1pct_accuracy_range": (
+            f"0 <= sqrt(h/g)/Tz <= {wave_orbital.REPORTED_1PCT_ACCURACY_MAX_T}"
+        ),
+        "accuracy_range_semantics": "APPROXIMATION_ACCURACY_QUALIFICATION_NOT_VALIDITY_THRESHOLD",
+        "orbital_estimates_outside_reported_1pct_range_retained": True,
+        "outside_range_accuracy_not_quantified": True,
+        "tr155_notes_orbital_velocities_very_small_above_0_54": True,
         "equivalent_amplitude_definition": "sqrt(2) * Urms",
         "equivalent_peak_period_definition": "1.28 * Tz",
         "equivalent_peak_period_is_diagnostic_not_observed_tp": True,
@@ -2194,9 +2282,10 @@ def _cmd_build_wave_orbital_forcing(args: argparse.Namespace) -> int:
         "source_grid_resolution_note": wave_orbital_map.SOURCE_GRID_RESOLUTION_NOTE,
         "map_colour_variable": "orbital_rms_p95_m_s",
         "limitations": [
-            "The Soulsby & Smallman approximation is only accepted within its own "
-            "calibration domain (t <= 0.54) -- a method accuracy domain, not a universal "
-            "physical threshold.",
+            "The Soulsby & Smallman approximation is reported by TR155 to fit the exact "
+            "computed spectral value to better than 1% only for Tn/Tz <= 0.54 -- an "
+            "accuracy qualification, not a validity threshold; Urms is still computed "
+            "and reported above it (TR155 notes orbital velocities are very small there).",
             "Non-breaking waves are assumed; no breaking-wave classifier is applied here.",
             "Wave-current interaction and bed shear stress are not modelled in this ticket.",
             "The equivalent amplitude and equivalent peak period are derived helpers, "
@@ -2262,6 +2351,8 @@ def _cmd_build_wave_orbital_forcing(args: argparse.Namespace) -> int:
         segments_path=segments_path,
         png_path=png_path,
         png_dimensions=png_dimensions,
+        old_vs_new_comparison=old_vs_new_comparison,
+        old_vs_new_per_node=old_vs_new_per_node,
     )
     return 0
 

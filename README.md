@@ -633,3 +633,47 @@ otherwise, never an interactive credential prompt.
   shear stress, friction factor, Shields parameter, sediment mobility,
   erosion/deposition, scour, free-span, or risk scoring is computed
   anywhere in this ticket -- no further ticket has started.
+- `MAR-011A`: corrects a real scientific error in MAR-011 -- `Tn/Tz <= 0.54`
+  was incorrectly treated as a hard validity boundary, silently nulling
+  the canonical Urms for 275,434 of 1,895,264 real PL854 rows (14.5%)
+  solely because `t > 0.54`. Soulsby (2006), HR Wallingford Report TR155
+  Section 3.1, actually states only that the approximation fits the exact
+  computed spectral value to BETTER THAN 1% for `0 <= Tn/Tz <= 0.54` and
+  that "orbital velocities are very small" above it -- an ACCURACY
+  QUALIFICATION, never "the method is invalid here". Fixed:
+  `wave_orbital_velocity_rms_near_bed_m_s` is now computed for every
+  physically valid row (finite Hs>=0, finite Tz>0, finite depth>0)
+  regardless of `t`; only genuinely invalid Hs/Tz/depth still nulls it.
+  The status column is renamed `soulsby_smallman_accuracy_status`
+  (`WITHIN_.../OUTSIDE_REPORTED_BETTER_THAN_1PCT_ACCURACY_RANGE`) to make
+  the semantics explicit. A real edge case caught in review: an exactly-
+  zero depth yields a mathematically finite (not NaN) `t` via plain
+  propagation, which would otherwise misclassify as "within range" --
+  caught by an explicit depth/period validity check before classification,
+  independent of the incidental NaN-propagation path. Data completeness is
+  now cleanly separated from method-accuracy coverage
+  (`input_valid_count`/`input_data_completeness_pct` vs
+  `within_reported_1pct_accuracy_count`/`outside_reported_1pct_accuracy_count`)
+  -- completeness is reduced only by genuinely invalid/missing data, never
+  by `t > 0.54`; a conditional `orbital_rms_p95_within_reported_1pct_accuracy_range_m_s`
+  secondary QA statistic is retained under its own explicit name but never
+  substituted for the canonical full-record percentiles. The map/CLI's
+  temporal-integrity check (duplicate/non-unique/non-monotonic
+  `(wave_node_id, time_utc)`) is upgraded from a warning to a hard failure.
+
+  Real re-execution against PL854 (no network) confirms the canonical p95
+  shifted down modestly and consistently once the wrongly-nulled ~14.5% of
+  (correctly small, per TR155) rows are included: route-wide Urms p95
+  0.132 -> 0.128 m/s, p99 0.238 -> 0.233 m/s, max unchanged at 0.717 m/s
+  (the largest sea states were already within-range); per node the p95
+  shift ranges from -3.2% to -9.7%. Input data completeness is now 100% at
+  every node (was previously conflated with the accuracy-range split).
+  8 new/rewritten regression tests confirm: `t > 0.54` with valid inputs
+  still yields a finite Urms; genuinely invalid depth/Tz still yields none;
+  completeness is unaffected by `t > 0.54`; the canonical and conditional
+  percentiles are independently and correctly scoped; and duplicate/
+  non-monotonic rows now fail the CLI hard. Full offline suite (609 tests)
+  and repo-wide `ruff format`/`ruff check` pass clean. No wave-current
+  interaction, bed shear stress, friction factor, Shields parameter,
+  sediment mobility, or risk scoring is computed anywhere in this ticket --
+  no further ticket has started.

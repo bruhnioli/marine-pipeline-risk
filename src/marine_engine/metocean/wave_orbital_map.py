@@ -328,6 +328,8 @@ def render_wave_orbital_map(
         "Route: NSTA | Waves: Copernicus Marine NWSHELF_REANALYSIS_WAV_004_015 | "
         "Background: EMODnet",
         "Wave model support ~1.5–2 km; colours do not represent 25 m hydrodynamic resolution.",
+        "Soulsby–Smallman approximation; <1% agreement reported for Tn/Tz <= 0.54. Higher-t "
+        "states retained and accuracy-qualified, not discarded.",
         "Wave-current interaction and bed shear stress are not yet applied.",
     ]
     ax.text(
@@ -504,10 +506,12 @@ def print_wave_orbital_report(
     segments_path: Path,
     png_path: Path,
     png_dimensions: tuple[int, int],
+    old_vs_new_comparison: dict[str, tuple[Any, Any]] | None = None,
+    old_vs_new_per_node: pd.DataFrame | None = None,
     file: Any = None,
 ) -> None:
     file = file or sys.stdout
-    lines = ["=== PL854 Wave-Only Spectral Near-Bed Orbital Velocity (MAR-011) ===", ""]
+    lines = ["=== PL854 Wave-Only Spectral Near-Bed Orbital Velocity (MAR-011/MAR-011A) ===", ""]
 
     lines.append("## Wave-input QA")
     s = domain_summary
@@ -535,12 +539,24 @@ def print_wave_orbital_report(
         f"p95={_fmt(s['t_parameter_p95'], '.4f')} max={_fmt(s['t_parameter_max'], '.4f')}"
     )
     lines.append(
-        f"  Rows outside {wave_orbital.CALIBRATION_DOMAIN_MAX_T:.2f} calibration domain: "
-        f"{s['rows_outside_calibration_domain']} / {s['total_rows']}"
+        f"  Input data completeness: {s['input_valid_count']} / {s['total_rows']} rows valid "
+        "(genuinely invalid Hs/Tz/depth only -- never reduced by t > "
+        f"{wave_orbital.REPORTED_1PCT_ACCURACY_MAX_T:.2f})"
+    )
+    lines.append(
+        f"  Within reported <1% accuracy range (Tn/Tz <= "
+        f"{wave_orbital.REPORTED_1PCT_ACCURACY_MAX_T:.2f}): "
+        f"{s['within_reported_1pct_accuracy_count']} / {s['input_valid_count']} valid rows"
+    )
+    lines.append(
+        "  Outside reported <1% accuracy range: "
+        f"{s['outside_reported_1pct_accuracy_count']} / {s['input_valid_count']} valid rows "
+        "(estimate retained and accuracy-qualified, never discarded -- TR155 notes orbital "
+        "velocities are very small here)"
     )
     lines.append("")
 
-    lines.append("## Spectral near-bed orbital velocity")
+    lines.append("## Spectral near-bed orbital velocity (full physically valid record)")
     if not stats_df.empty:
         lines.append(
             "  Urms (m/s): mean="
@@ -557,12 +573,34 @@ def print_wave_orbital_report(
             f"max={_fmt(stats_df['orbital_amplitude_max_m_s'].max())}"
         )
         lines.append(
+            "  [QA only] p95 within reported <1% accuracy range subset: "
+            f"{_fmt(stats_df['orbital_rms_p95_within_reported_1pct_accuracy_range_m_s'].max())} "
+            "m/s -- never substituted for the canonical full-record p95 above"
+        )
+        lines.append(
             "  Peak-period diagnostic (observed Tp / (1.28*Tz)): "
             f"p05={_fmt(stats_df['tp_observed_to_equivalent_p05_ratio'].mean(), '.3f')} "
             f"median={_fmt(stats_df['tp_observed_to_equivalent_median_ratio'].mean(), '.3f')} "
             f"p95={_fmt(stats_df['tp_observed_to_equivalent_p95_ratio'].mean(), '.3f')}"
         )
     lines.append("")
+
+    if old_vs_new_comparison:
+        lines.append("## Old (conditional t<=0.54) -> corrected (full-record) comparison")
+        for label, (old_value, new_value) in old_vs_new_comparison.items():
+            changed = "CHANGED" if old_value != new_value else "unchanged"
+            lines.append(f"  {label}: old={_fmt(old_value)} -> new={_fmt(new_value)} ({changed})")
+        lines.append("")
+
+    if old_vs_new_per_node is not None and not old_vs_new_per_node.empty:
+        lines.append("## Per-node old conditional p95 -> new full-record p95")
+        for _, row in old_vs_new_per_node.iterrows():
+            lines.append(
+                f"  {row['wave_node_id']}: old={_fmt(row['old_p95_m_s'])} -> "
+                f"new={_fmt(row['new_p95_m_s'])} | abs_diff={_fmt(row['abs_diff_m_s'])} "
+                f"| pct_diff={_fmt(row['pct_diff_pct'], '.1f')}%"
+            )
+        lines.append("")
 
     lines.append("## Map support")
     lines.append(f"  Route-used wave nodes: {route_used_node_count}")

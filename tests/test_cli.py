@@ -1351,9 +1351,17 @@ def test_build_wave_orbital_forcing_command_end_to_end(
     assert len(hourly_df) == 6 * 2  # 6 timestamps x 2 nodes, one row per (node, time)
     assert not any("current" in c.lower() for c in hourly_df.columns)
     assert (hourly_df["tz_source"] == "VTM02").all()
+    # MAR-011A: every row has a canonical Urms (the fixture's own t <= 0.54,
+    # but this also confirms the column exists under its corrected name).
+    assert hourly_df["wave_orbital_velocity_rms_near_bed_m_s"].notna().all()
+    assert set(hourly_df["soulsby_smallman_accuracy_status"].unique()) <= {
+        "WITHIN_REPORTED_BETTER_THAN_1PCT_ACCURACY_RANGE",
+        "OUTSIDE_REPORTED_BETTER_THAN_1PCT_ACCURACY_RANGE",
+    }
 
     stats_df = pd.read_parquet(stats_path)
     assert set(stats_df["wave_node_id"].unique()) == {"wave_A", "wave_B"}
+    assert (stats_df["input_data_completeness_pct"] <= 100.0001).all()
 
     segments_gdf = gpd.read_file(segments_path, layer="wave_orbital_reference_segments")
     assert len(segments_gdf) == 2  # one contiguous section per node
@@ -1362,6 +1370,11 @@ def test_build_wave_orbital_forcing_command_end_to_end(
     assert metadata["scientific_role"] == "WAVE_ONLY_SPECTRAL_NEAR_BED_ORBITAL_VELOCITY"
     assert metadata["current_effect_on_wave_dispersion_applied"] is False
     assert metadata["nonbreaking_wave_assumption_applied"] is True
+    assert (
+        metadata["accuracy_range_semantics"]
+        == "APPROXIMATION_ACCURACY_QUALIFICATION_NOT_VALIDITY_THRESHOLD"
+    )
+    assert metadata["orbital_estimates_outside_reported_1pct_range_retained"] is True
     assert png_path.stat().st_size > 0
 
 
@@ -1375,3 +1388,53 @@ def test_build_wave_orbital_forcing_command_is_idempotent_offline(tmp_path: Path
 
     assert first_exit_code == 0
     assert second_exit_code == 0
+
+
+def test_build_wave_orbital_forcing_command_fails_hard_on_duplicate_node_time_rows(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MAR-011A Section 7/10-F: a duplicate (wave_node_id, time_utc) row must be a
+    hard integrity failure -- never merely a warning that lets the run continue."""
+
+    config_path = _write_wave_orbital_forcing_fixture(tmp_path)
+    wave_hourly_path = tmp_path / "interim" / "pl854" / "metocean" / "wave_3hourly.parquet"
+    wave_df = pd.read_parquet(wave_hourly_path)
+    duplicated = pd.concat([wave_df, wave_df.iloc[[0]]], ignore_index=True)
+    duplicated.to_parquet(wave_hourly_path)
+
+    exit_code = main(["build-wave-orbital-forcing", str(config_path)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "temporal integrity" in err
+
+    # The canonical output must NOT have been (successfully) written past the check.
+    stats_path = (
+        tmp_path / "processed" / "pl854" / "metocean" / "wave_orbital_velocity_stats.parquet"
+    )
+    assert not stats_path.exists()
+
+
+def test_build_wave_orbital_forcing_command_fails_hard_on_non_monotonic_node_series(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MAR-011A Section 7/10-G: a non-monotonic per-node time series must also be a
+    hard integrity failure."""
+
+    config_path = _write_wave_orbital_forcing_fixture(tmp_path)
+    wave_hourly_path = tmp_path / "interim" / "pl854" / "metocean" / "wave_3hourly.parquet"
+    wave_df = pd.read_parquet(wave_hourly_path)
+    # Swap two of node A's timestamps out of order (same set of instants, so this
+    # is not merely a duplicate -- it is genuinely non-monotonic per node).
+    node_a_positions = wave_df.index[wave_df["wave_node_id"] == "wave_A"][:2].tolist()
+    reordered = wave_df.copy()
+    reordered.loc[node_a_positions, "time_utc"] = wave_df.loc[
+        list(reversed(node_a_positions)), "time_utc"
+    ].to_numpy()
+    reordered.to_parquet(wave_hourly_path)
+
+    exit_code = main(["build-wave-orbital-forcing", str(config_path)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "temporal integrity" in err

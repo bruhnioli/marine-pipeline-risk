@@ -1,4 +1,4 @@
-"""Wave-only spectral near-bed orbital velocity (MAR-011).
+"""Wave-only spectral near-bed orbital velocity (MAR-011/MAR-011A).
 
 Scope -- read before touching this module
 --------------------------------------------
@@ -35,23 +35,32 @@ wave formulation or perform independent literature research here)
 wave support node -- never the canonical MAR-006 EMODnet LAT depth, never
 a current-product bathymetry substitute.
 
-Calibration domain (Section 6) -- a method accuracy domain, not a
-physical law
+Accuracy-qualification range, NOT a validity boundary (MAR-011A correction)
 -------------------------------------------------------------------------------
-The approximation is accepted for `0 <= t <= 0.54`
-(`CALIBRATION_DOMAIN_MAX_T`) -- never called a universal wave-physics
-threshold, always surfaced under the explicitly-named
-`orbital_velocity_method_status` (`WITHIN_.../OUTSIDE_...`). A row outside
-the domain (or with invalid Hs/Tz/depth) keeps its raw Hs/Tm02/Tp/depth
-values and its status, but the canonical Urms/equivalent-amplitude are
-null -- never a silent out-of-domain extrapolation.
+MAR-011 originally (and INCORRECTLY) treated `0 <= t <= 0.54` as a hard
+validity boundary, nulling the canonical Urms for ~14.5% of the real
+PL854 record solely because `t > 0.54`. Soulsby (2006), HR Wallingford
+Report TR155, Section 3.1, actually states only that the approximation
+fits the exact computed spectral value to BETTER THAN 1% for
+`0 <= Tn/Tz <= 0.54`, and that orbital velocities are very small for
+`Tn/Tz > 0.54` -- an ACCURACY QUALIFICATION, never "the method is invalid
+above 0.54". `REPORTED_1PCT_ACCURACY_MAX_T` (0.54) is therefore surfaced
+under `soulsby_smallman_accuracy_status`
+(`WITHIN_REPORTED_BETTER_THAN_1PCT_ACCURACY_RANGE` /
+`OUTSIDE_REPORTED_BETTER_THAN_1PCT_ACCURACY_RANGE`) -- Urms is computed
+and reported for EVERY physically valid (finite Hs>=0, finite Tz>0,
+finite depth>0) row regardless of `t`; only genuinely invalid Hs/Tz/depth
+inputs null the canonical Urms, never `t > 0.54` alone. OUTSIDE means
+"TR155 does not provide the same <1% accuracy guarantee here" -- it never
+means "not computed" and never claims a quantified accuracy outside the
+range.
 
-Non-breaking assumption (Section 7) -- `hs_over_model_depth` is reported
-as a QA diagnostic only; this module never invents a breaking-wave cutoff
-and never rejects a row on an Hs/h threshold.
+Non-breaking assumption (Section 7 of MAR-011) -- `hs_over_model_depth` is
+reported as a QA diagnostic only; this module never invents a
+breaking-wave cutoff and never rejects a row on an Hs/h threshold.
 
-Current / wave-current interaction (Section 8, 9)
-------------------------------------------------------
+Current / wave-current interaction (Section 8, 9 of MAR-011)
+------------------------------------------------------------------
 This module is WAVE ONLY. It never reads current data, never applies a
 Doppler/current-modified dispersion correction, never computes an
 apparent wave-current roughness, and never applies a directional-
@@ -64,18 +73,21 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-# --- Fixed scientific constants (Section 4, 6 of the ticket -- do not change) -------
+# --- Fixed scientific constants (do not change) -------------------------------------
 
 GRAVITY_M_S2 = 9.80665
 
 TZ_SOURCE = "VTM02"
 EQUIVALENT_PEAK_PERIOD_FACTOR = 1.28  # Section 5: equivalent_peak_period = 1.28 * Tz
 
-# Project method-accuracy domain (Section 6), never a universal physical
-# threshold -- always surfaced under an explicitly-named status string.
-CALIBRATION_DOMAIN_MAX_T = 0.54
-WITHIN_CALIBRATION_DOMAIN = "WITHIN_SOULSBY_SMALLMAN_CALIBRATION_RANGE"
-OUTSIDE_CALIBRATION_DOMAIN = "OUTSIDE_SOULSBY_SMALLMAN_CALIBRATION_RANGE"
+# TR155's own reported accuracy-qualification boundary (Soulsby 2006, Section
+# 3.1: "fits the exact computed values to better than 1% for 0 <= Tn/Tz <=
+# 0.54 ... orbital velocities are very small for Tn/Tz > 0.54"). This is an
+# ACCURACY QUALIFICATION, never a validity/calibration boundary -- Urms is
+# still computed and reported above it (MAR-011A).
+REPORTED_1PCT_ACCURACY_MAX_T = 0.54
+WITHIN_REPORTED_1PCT_ACCURACY_RANGE = "WITHIN_REPORTED_BETTER_THAN_1PCT_ACCURACY_RANGE"
+OUTSIDE_REPORTED_1PCT_ACCURACY_RANGE = "OUTSIDE_REPORTED_BETTER_THAN_1PCT_ACCURACY_RANGE"
 
 SCIENTIFIC_ROLE = "WAVE_ONLY_SPECTRAL_NEAR_BED_ORBITAL_VELOCITY"
 
@@ -87,7 +99,8 @@ class OrbitalVelocityCompletenessError(Exception):
     `NormalizationCompletenessError` for this derived product: since the
     3-hourly orbital table is built strictly from the already-deduplicated
     MAR-009B canonical wave series, completeness here can never
-    legitimately exceed 100% either.
+    legitimately exceed 100% either. Unaffected by MAR-011A -- this is
+    about genuinely invalid/missing input data, never about `t > 0.54`.
     """
 
 
@@ -123,9 +136,10 @@ def compute_orbital_velocity_rms_m_s(
 ) -> np.ndarray:
     """Urms = 0.25*Hs / [Tn * (1 + A*t^2)^3] -- the Soulsby & Smallman approximation.
 
-    Callers must pre-screen eligibility (`is_orbital_velocity_input_valid`
-    + `classify_calibration_domain_status`); this function computes the
-    formula only and does not itself null out-of-domain rows.
+    Computed for every physically valid row regardless of `t` (MAR-011A) --
+    callers pre-screen only genuine Hs/Tz/depth validity
+    (`is_orbital_velocity_input_valid`), never `t <= 0.54`, before using
+    this result as the canonical Urms.
     """
 
     hs = np.asarray(hs_m, dtype=float)
@@ -151,10 +165,11 @@ def compute_equivalent_peak_period_from_tz_s(tz_s: np.ndarray) -> np.ndarray:
 def is_orbital_velocity_input_valid(
     hs_m: np.ndarray, tz_s: np.ndarray, model_bathymetry_m: np.ndarray
 ) -> np.ndarray:
-    """Finite Hs>=0 AND finite Tz>0 AND finite model depth>0 (Section 6).
+    """Finite Hs>=0 AND finite Tz>0 AND finite model depth>0.
 
-    `Hs == 0` is explicitly valid (a flat calm sea state) and must yield
-    `Urms == 0`, never be rejected.
+    This is the ONLY gate for the canonical Urms (MAR-011A) -- `t > 0.54`
+    never rejects a row. `Hs == 0` is explicitly valid (a flat calm sea
+    state) and must yield `Urms == 0`, never be rejected.
     """
 
     hs = np.asarray(hs_m, dtype=float)
@@ -164,12 +179,13 @@ def is_orbital_velocity_input_valid(
 
 
 def is_depth_and_period_valid(tz_s: np.ndarray, model_bathymetry_m: np.ndarray) -> np.ndarray:
-    """Finite Tz>0 AND finite model depth>0 -- the subset of Section 6's validity
-    conditions that `t`/`A`/`orbital_velocity_method_status` themselves depend on.
+    """Finite Tz>0 AND finite model depth>0 -- the subset of validity conditions
+    that `t`/`A`/`soulsby_smallman_accuracy_status` themselves depend on.
 
     `h == 0` is a real edge case worth naming explicitly: `Tn = sqrt(0/g) == 0`
     is finite (not NaN), so a naive finite-only check on `t` would otherwise
-    let an invalid zero depth slip through as spuriously "within domain".
+    let an invalid zero depth slip through as spuriously within the
+    accuracy-qualified range.
     """
 
     tz = np.asarray(tz_s, dtype=float)
@@ -177,22 +193,27 @@ def is_depth_and_period_valid(tz_s: np.ndarray, model_bathymetry_m: np.ndarray) 
     return np.isfinite(tz) & (tz > 0) & np.isfinite(h) & (h > 0)
 
 
-def classify_calibration_domain_status(t: np.ndarray) -> np.ndarray:
-    """WITHIN/OUTSIDE the Soulsby & Smallman calibration domain (Section 6).
+def classify_soulsby_smallman_accuracy_status(t: np.ndarray) -> np.ndarray:
+    """WITHIN/OUTSIDE TR155's own reported better-than-1%-accuracy range.
 
-    A non-finite `t` (e.g. from an invalid depth or Tz) is always OUTSIDE
-    -- never silently treated as within range.
+    An ACCURACY QUALIFICATION, never a validity boundary (MAR-011A): a row
+    classified OUTSIDE still has a computed canonical Urms elsewhere in the
+    pipeline -- this function only labels how much accuracy TR155 itself
+    claims for that estimate. A non-finite `t` (e.g. from an invalid depth
+    or Tz) is always OUTSIDE -- it is never silently treated as within the
+    reported-accuracy range, though genuinely invalid inputs are rejected
+    separately via `is_orbital_velocity_input_valid`.
     """
 
     t = np.asarray(t, dtype=float)
     return np.where(
-        np.isfinite(t) & (t >= 0.0) & (t <= CALIBRATION_DOMAIN_MAX_T),
-        WITHIN_CALIBRATION_DOMAIN,
-        OUTSIDE_CALIBRATION_DOMAIN,
+        np.isfinite(t) & (t >= 0.0) & (t <= REPORTED_1PCT_ACCURACY_MAX_T),
+        WITHIN_REPORTED_1PCT_ACCURACY_RANGE,
+        OUTSIDE_REPORTED_1PCT_ACCURACY_RANGE,
     )
 
 
-# --- 3-hourly canonical orbital velocity table (Section 10) -------------------------
+# --- 3-hourly canonical orbital velocity table (Section 10 of MAR-011) --------------
 
 WAVE_ORBITAL_VELOCITY_COLUMNS = (
     "wave_node_id",
@@ -210,7 +231,7 @@ WAVE_ORBITAL_VELOCITY_COLUMNS = (
     "soulsby_smallman_t_parameter",
     "soulsby_smallman_A",
     "hs_over_model_depth",
-    "orbital_velocity_method_status",
+    "soulsby_smallman_accuracy_status",
     "wave_orbital_velocity_rms_near_bed_m_s",
     "wave_orbital_velocity_equivalent_amplitude_m_s",
     "equivalent_peak_period_from_tz_s",
@@ -231,10 +252,11 @@ def build_wave_orbital_velocity_3hourly(wave_df: pd.DataFrame) -> pd.DataFrame:
 
     `wave_df` must already carry a `model_bathymetry_m` column (joined by
     the caller from the wave product's own static support-node table,
-    Section 2) -- this function performs NO fan-out and drops NO input
-    row: every `(wave_node_id, time_utc)` pair from the input survives,
-    with canonical values null wherever inputs are invalid or the
-    calibration domain does not apply (Section 6).
+    Section 2 of MAR-011) -- this function performs NO fan-out and drops
+    NO input row: every `(wave_node_id, time_utc)` pair from the input
+    survives. The canonical Urms/equivalent-amplitude are null ONLY for
+    genuinely invalid Hs/Tz/depth (MAR-011A) -- `t > 0.54` alone never
+    nulls them, it only changes the reported `soulsby_smallman_accuracy_status`.
     """
 
     if wave_df.empty:
@@ -250,12 +272,14 @@ def build_wave_orbital_velocity_3hourly(wave_df: pd.DataFrame) -> pd.DataFrame:
     t_raw = compute_soulsby_smallman_t_parameter(tn, tz)
     # An exactly-zero depth yields a finite (not NaN) Tn/t via plain propagation
     # -- explicitly force t to NaN wherever depth/Tz are invalid so the
-    # calibration-domain status can never read a spuriously "within domain" t.
+    # accuracy status can never read a spuriously "within range" t.
     t = np.where(depth_period_valid, t_raw, np.nan)
     a = compute_soulsby_smallman_a(t)
-    status = classify_calibration_domain_status(t)
+    status = classify_soulsby_smallman_accuracy_status(t)
 
-    eligible = is_orbital_velocity_input_valid(hs, tz, h) & (status == WITHIN_CALIBRATION_DOMAIN)
+    # MAR-011A: eligibility for the canonical Urms is genuine Hs/Tz/depth
+    # validity ONLY -- never gated by `status`/`t <= 0.54`.
+    eligible = is_orbital_velocity_input_valid(hs, tz, h)
     urms_raw = compute_orbital_velocity_rms_m_s(hs, tn, a, t)
     urms = np.where(eligible, urms_raw, np.nan)
     amplitude = compute_equivalent_amplitude_m_s(urms)
@@ -291,7 +315,7 @@ def build_wave_orbital_velocity_3hourly(wave_df: pd.DataFrame) -> pd.DataFrame:
             "soulsby_smallman_t_parameter": t,
             "soulsby_smallman_A": a,
             "hs_over_model_depth": hs_over_model_depth,
-            "orbital_velocity_method_status": status,
+            "soulsby_smallman_accuracy_status": status,
             "wave_orbital_velocity_rms_near_bed_m_s": urms,
             "wave_orbital_velocity_equivalent_amplitude_m_s": amplitude,
             "equivalent_peak_period_from_tz_s": equivalent_peak_period,
@@ -305,11 +329,18 @@ def build_wave_orbital_velocity_3hourly(wave_df: pd.DataFrame) -> pd.DataFrame:
     return result[list(WAVE_ORBITAL_VELOCITY_COLUMNS)]
 
 
-# --- Route-wide wave-input / calibration-domain QA summary (Section 21) ------------
+# --- Route-wide wave-input / accuracy-range QA summary ------------------------------
 
 
 def compute_wave_orbital_domain_summary(hourly_df: pd.DataFrame) -> dict[str, Any]:
-    """Route-wide Hs/depth/Tm02/Tp/Hs-over-depth/t stats + count outside calibration domain."""
+    """Route-wide Hs/depth/Tm02/Tp/Hs-over-depth/t stats + accuracy-range counts.
+
+    `within_reported_1pct_accuracy_count`/`outside_reported_1pct_accuracy_count`
+    are restricted to rows with a genuinely valid (non-null canonical Urms)
+    input -- a row rejected for invalid Hs/Tz/depth is counted in neither
+    (MAR-011A Section 4): the accuracy-range breakdown describes only the
+    valid sea states, never conflated with missing/invalid data.
+    """
 
     empty = {
         "model_bathymetry_m_min": None,
@@ -332,7 +363,9 @@ def compute_wave_orbital_domain_summary(hourly_df: pd.DataFrame) -> dict[str, An
         "t_parameter_median": None,
         "t_parameter_p95": None,
         "t_parameter_max": None,
-        "rows_outside_calibration_domain": 0,
+        "input_valid_count": 0,
+        "within_reported_1pct_accuracy_count": 0,
+        "outside_reported_1pct_accuracy_count": 0,
         "total_rows": 0,
     }
     if hourly_df.empty:
@@ -344,8 +377,13 @@ def compute_wave_orbital_domain_summary(hourly_df: pd.DataFrame) -> dict[str, An
     tp = hourly_df["tp_s"].dropna()
     hs_over_depth = hourly_df["hs_over_model_depth"].dropna()
     t_values = hourly_df["soulsby_smallman_t_parameter"].dropna()
-    outside_count = int(
-        (hourly_df["orbital_velocity_method_status"] == OUTSIDE_CALIBRATION_DOMAIN).sum()
+
+    valid_mask = hourly_df["wave_orbital_velocity_rms_near_bed_m_s"].notna()
+    within_mask = valid_mask & (
+        hourly_df["soulsby_smallman_accuracy_status"] == WITHIN_REPORTED_1PCT_ACCURACY_RANGE
+    )
+    outside_mask = valid_mask & (
+        hourly_df["soulsby_smallman_accuracy_status"] == OUTSIDE_REPORTED_1PCT_ACCURACY_RANGE
     )
 
     return {
@@ -373,20 +411,26 @@ def compute_wave_orbital_domain_summary(hourly_df: pd.DataFrame) -> dict[str, An
         "t_parameter_median": float(t_values.median()) if len(t_values) else None,
         "t_parameter_p95": float(t_values.quantile(0.95)) if len(t_values) else None,
         "t_parameter_max": float(t_values.max()) if len(t_values) else None,
-        "rows_outside_calibration_domain": outside_count,
+        "input_valid_count": int(valid_mask.sum()),
+        "within_reported_1pct_accuracy_count": int(within_mask.sum()),
+        "outside_reported_1pct_accuracy_count": int(outside_mask.sum()),
         "total_rows": int(len(hourly_df)),
     }
 
 
-# --- Per-node statistics (Section 12) ------------------------------------------------
+# --- Per-node statistics (Section 12 of MAR-011, Sections 4-5 of MAR-011A) ----------
 
 WAVE_ORBITAL_VELOCITY_STATS_COLUMNS = (
     "wave_node_id",
     "start_time_utc",
     "end_time_utc",
     "expected_3hour_count",
-    "valid_orbital_count",
-    "completeness_pct",
+    "input_valid_count",
+    "input_data_completeness_pct",
+    "within_reported_1pct_accuracy_count",
+    "within_reported_1pct_accuracy_pct",
+    "outside_reported_1pct_accuracy_count",
+    "outside_reported_1pct_accuracy_pct",
     "model_bathymetry_m",
     "hs_mean_m",
     "hs_p95_m",
@@ -400,13 +444,13 @@ WAVE_ORBITAL_VELOCITY_STATS_COLUMNS = (
     "t_parameter_median",
     "t_parameter_p95",
     "t_parameter_max",
-    "rows_outside_calibration_range",
     "orbital_rms_mean_m_s",
     "orbital_rms_median_m_s",
     "orbital_rms_p90_m_s",
     "orbital_rms_p95_m_s",
     "orbital_rms_p99_m_s",
     "orbital_rms_max_m_s",
+    "orbital_rms_p95_within_reported_1pct_accuracy_range_m_s",
     "orbital_amplitude_mean_m_s",
     "orbital_amplitude_p95_m_s",
     "orbital_amplitude_p99_m_s",
@@ -418,6 +462,8 @@ WAVE_ORBITAL_VELOCITY_STATS_COLUMNS = (
 
 
 def _completeness_pct(valid_count: int, expected_count: int) -> float | None:
+    """Genuine data completeness only -- never reduced by `t > 0.54` (MAR-011A Section 4)."""
+
     if not expected_count:
         return None
     if valid_count > expected_count:
@@ -428,8 +474,22 @@ def _completeness_pct(valid_count: int, expected_count: int) -> float | None:
     return 100.0 * valid_count / expected_count
 
 
+def _pct_of(count: int, denominator: int) -> float | None:
+    if not denominator:
+        return None
+    return 100.0 * count / denominator
+
+
 def compute_wave_orbital_velocity_stats(hourly_df: pd.DataFrame) -> pd.DataFrame:
-    """One row per real route-used wave node: completeness, wave-input, method-QA, orbital stats."""
+    """One row per real route-used wave node.
+
+    Canonical `orbital_rms_*`/`orbital_amplitude_*` statistics are computed
+    over ALL genuinely valid rows (MAR-011A Section 5) -- the full
+    physically valid record, never the `t <= 0.54` subset alone.
+    `orbital_rms_p95_within_reported_1pct_accuracy_range_m_s` is a
+    separate, explicitly-named secondary QA statistic over that subset --
+    never substituted for the canonical full-record p95.
+    """
 
     if hourly_df.empty:
         return pd.DataFrame(columns=list(WAVE_ORBITAL_VELOCITY_STATS_COLUMNS))
@@ -449,9 +509,18 @@ def compute_wave_orbital_velocity_stats(hourly_df: pd.DataFrame) -> pd.DataFrame
         valid_t = group["soulsby_smallman_t_parameter"].dropna()
         valid_ratio = group["observed_to_equivalent_peak_period_ratio"].dropna()
         bathymetry_values = group["model_bathymetry_m"].dropna()
-        outside_count = int(
-            (group["orbital_velocity_method_status"] == OUTSIDE_CALIBRATION_DOMAIN).sum()
+
+        valid_mask = group["wave_orbital_velocity_rms_near_bed_m_s"].notna()
+        within_mask = valid_mask & (
+            group["soulsby_smallman_accuracy_status"] == WITHIN_REPORTED_1PCT_ACCURACY_RANGE
         )
+        outside_mask = valid_mask & (
+            group["soulsby_smallman_accuracy_status"] == OUTSIDE_REPORTED_1PCT_ACCURACY_RANGE
+        )
+        input_valid_count = int(valid_mask.sum())
+        within_count = int(within_mask.sum())
+        outside_count = int(outside_mask.sum())
+        within_p95 = group.loc[within_mask, "wave_orbital_velocity_rms_near_bed_m_s"]
 
         records.append(
             {
@@ -459,8 +528,12 @@ def compute_wave_orbital_velocity_stats(hourly_df: pd.DataFrame) -> pd.DataFrame
                 "start_time_utc": start,
                 "end_time_utc": end,
                 "expected_3hour_count": expected_steps,
-                "valid_orbital_count": int(len(valid_orbital)),
-                "completeness_pct": _completeness_pct(len(valid_orbital), expected_steps),
+                "input_valid_count": input_valid_count,
+                "input_data_completeness_pct": _completeness_pct(input_valid_count, expected_steps),
+                "within_reported_1pct_accuracy_count": within_count,
+                "within_reported_1pct_accuracy_pct": _pct_of(within_count, input_valid_count),
+                "outside_reported_1pct_accuracy_count": outside_count,
+                "outside_reported_1pct_accuracy_pct": _pct_of(outside_count, input_valid_count),
                 "model_bathymetry_m": float(bathymetry_values.iloc[0])
                 if len(bathymetry_values)
                 else None,
@@ -476,7 +549,6 @@ def compute_wave_orbital_velocity_stats(hourly_df: pd.DataFrame) -> pd.DataFrame
                 "t_parameter_median": float(valid_t.median()) if len(valid_t) else None,
                 "t_parameter_p95": float(valid_t.quantile(0.95)) if len(valid_t) else None,
                 "t_parameter_max": float(valid_t.max()) if len(valid_t) else None,
-                "rows_outside_calibration_range": outside_count,
                 "orbital_rms_mean_m_s": float(valid_orbital.mean()) if len(valid_orbital) else None,
                 "orbital_rms_median_m_s": float(valid_orbital.median())
                 if len(valid_orbital)
@@ -491,6 +563,11 @@ def compute_wave_orbital_velocity_stats(hourly_df: pd.DataFrame) -> pd.DataFrame
                 if len(valid_orbital)
                 else None,
                 "orbital_rms_max_m_s": float(valid_orbital.max()) if len(valid_orbital) else None,
+                "orbital_rms_p95_within_reported_1pct_accuracy_range_m_s": float(
+                    within_p95.quantile(0.95)
+                )
+                if len(within_p95)
+                else None,
                 "orbital_amplitude_mean_m_s": float(valid_amplitude.mean())
                 if len(valid_amplitude)
                 else None,
