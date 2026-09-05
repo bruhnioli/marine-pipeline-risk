@@ -15,7 +15,12 @@ from shapely.ops import unary_union
 
 from marine_engine import __version__
 from marine_engine.config import load_study_config
-from marine_engine.metocean import current_map, current_normalization
+from marine_engine.metocean import (
+    current_map,
+    current_normalization,
+    wave_orbital,
+    wave_orbital_map,
+)
 from marine_engine.metocean import evidence as metocean_evidence
 from marine_engine.morphology import regional
 from marine_engine.preprocessing import bathymetry, source_resolution
@@ -2016,6 +2021,251 @@ def _cmd_build_current_normalization(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_wave_orbital_forcing(args: argparse.Namespace) -> int:
+    """MAR-011: wave-only spectral near-bed orbital velocity + reference map.
+
+    Requires the MAR-009B canonical wave outputs to already exist on disk;
+    performs NO network request and NO Copernicus acquisition (Section 18)
+    -- everything it reads was already downloaded and normalized by
+    `build-metocean-evidence`. Reads no current-related file at all.
+    """
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    pipeline_gpkg_path, _aoi_gpkg_path, _chainage_gpkg_path, interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+    metocean_interim_dir = interim_dir / "metocean"
+    metocean_processed_dir = study_dir / "metocean"
+    maps_dir = study_dir / "maps"
+
+    wave_hourly_path = metocean_interim_dir / "wave_3hourly.parquet"
+    wave_nodes_path = metocean_interim_dir / "wave_support_nodes.parquet"
+    chainage_metocean_path = metocean_processed_dir / "chainage_metocean_evidence.parquet"
+    required_paths = (
+        pipeline_gpkg_path,
+        wave_hourly_path,
+        wave_nodes_path,
+        chainage_metocean_path,
+    )
+    missing = [str(p) for p in required_paths if not p.exists()]
+    if missing:
+        print(
+            "error: missing required canonical output(s) -- run build-chainage and "
+            f"build-metocean-evidence first: {missing}",
+            file=sys.stderr,
+        )
+        return 1
+
+    working_crs = config.crs.horizontal
+    try:
+        route, _attributes, source_crs = load_pipeline_route(pipeline_gpkg_path, pipeline_id)
+    except InvalidPipelineRouteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if source_crs != working_crs:
+        print(
+            f"error: pipeline CRS {source_crs} does not match configured working CRS {working_crs}",
+            file=sys.stderr,
+        )
+        return 1
+
+    wave_df = pd.read_parquet(wave_hourly_path)
+    wave_nodes_df = pd.read_parquet(wave_nodes_path)
+    chainage_metocean_df = pd.read_parquet(chainage_metocean_path)
+
+    # --- MAR-011 core: Soulsby & Smallman spectral orbital velocity ---------
+    # `model_bathymetry_m` comes from the WAVE product's OWN static support-
+    # node table (Section 2) -- never the canonical MAR-006 LAT depth, never
+    # a current-product bathymetry substitute.
+    wave_bathymetry_by_node = wave_nodes_df.set_index("node_id")["model_bathymetry_m"].to_dict()
+    wave_df = wave_df.copy()
+    wave_df["model_bathymetry_m"] = wave_df["wave_node_id"].map(wave_bathymetry_by_node)
+
+    try:
+        hourly_orbital_df = wave_orbital.build_wave_orbital_velocity_3hourly(wave_df)
+        stats_df = wave_orbital.compute_wave_orbital_velocity_stats(hourly_orbital_df)
+    except wave_orbital.OrbitalVelocityCompletenessError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    domain_summary = wave_orbital.compute_wave_orbital_domain_summary(hourly_orbital_df)
+    temporal_qa = metocean_evidence.validate_temporal_integrity(
+        hourly_orbital_df, time_column="time_utc", node_column="wave_node_id"
+    )
+    if temporal_qa.get("duplicate_node_time_row_count"):
+        print(
+            "warning: duplicate (wave_node_id, time_utc) rows detected in the canonical "
+            f"wave series: {temporal_qa['duplicate_node_time_row_count']}",
+            file=sys.stderr,
+        )
+
+    # --- per-node reference attributes for segment/map assembly ------------
+    stats_by_id = stats_df.set_index("wave_node_id")
+    node_attributes_by_id: dict[str, wave_orbital_map.WaveNodeReferenceAttributes] = {}
+    for node_id, row in stats_by_id.iterrows():
+        node_attributes_by_id[node_id] = wave_orbital_map.WaveNodeReferenceAttributes(
+            model_bathymetry_m=_none_if_nan(row.get("model_bathymetry_m")),
+            hs_p95_m=_none_if_nan(row.get("hs_p95_m")),
+            hs_p99_m=_none_if_nan(row.get("hs_p99_m")),
+            hs_max_m=_none_if_nan(row.get("hs_max_m")),
+            tm02_median_s=_none_if_nan(row.get("tm02_median_s")),
+            tm02_p95_s=_none_if_nan(row.get("tm02_p95_s")),
+            orbital_rms_mean_m_s=_none_if_nan(row.get("orbital_rms_mean_m_s")),
+            orbital_rms_p95_m_s=_none_if_nan(row.get("orbital_rms_p95_m_s")),
+            orbital_rms_p99_m_s=_none_if_nan(row.get("orbital_rms_p99_m_s")),
+            orbital_rms_max_m_s=_none_if_nan(row.get("orbital_rms_max_m_s")),
+            orbital_amplitude_p95_m_s=_none_if_nan(row.get("orbital_amplitude_p95_m_s")),
+            orbital_amplitude_p99_m_s=_none_if_nan(row.get("orbital_amplitude_p99_m_s")),
+            orbital_amplitude_max_m_s=_none_if_nan(row.get("orbital_amplitude_max_m_s")),
+        )
+
+    # --- contiguous map segments ---------------------------------------------
+    chainage_wave_df = chainage_metocean_df[
+        ["chainage_m", "wave_node_id", "wave_node_distance_m"]
+    ].copy()
+    segments_gdf = wave_orbital_map.build_wave_orbital_reference_segments(
+        pipeline_id=pipeline_id,
+        route=route,
+        chainage_wave_df=chainage_wave_df,
+        node_attributes_by_id=node_attributes_by_id,
+        working_crs=working_crs,
+    )
+    distance_diagnostics = metocean_evidence.compute_distance_diagnostics(
+        chainage_wave_df.rename(columns={"wave_node_distance_m": "distance_m"})
+    )
+
+    # --- write parquet/gpkg outputs ------------------------------------------
+    hourly_path = metocean_evidence.write_parquet(
+        hourly_orbital_df, metocean_interim_dir / "wave_orbital_velocity_3hourly.parquet"
+    )
+    stats_path = metocean_evidence.write_parquet(
+        stats_df, metocean_processed_dir / "wave_orbital_velocity_stats.parquet"
+    )
+    segments_path = wave_orbital_map.write_wave_orbital_reference_segments_gpkg(
+        segments_gdf, metocean_processed_dir / "wave_orbital_reference_segments.gpkg"
+    )
+
+    background_raster_path = study_dir / "bathymetry" / "emodnet_baseline_lat_100m.tif"
+    png_path = wave_orbital_map.render_wave_orbital_map(
+        segments_gdf=segments_gdf,
+        route=route,
+        working_crs=working_crs,
+        output_path=maps_dir / "pl854_wave_orbital_forcing.png",
+        background_raster_path=(
+            background_raster_path if background_raster_path.exists() else None
+        ),
+    )
+    png_dimensions = wave_orbital_map.read_png_dimensions(png_path)
+
+    # --- metadata --------------------------------------------------------------
+    metadata_path = metocean_processed_dir / "wave_orbital_velocity_metadata.json"
+    metadata = {
+        "scientific_role": wave_orbital.SCIENTIFIC_ROLE,
+        "gravity_m_s2": wave_orbital.GRAVITY_M_S2,
+        "hs_source": "VHM0",
+        "tz_source": wave_orbital.TZ_SOURCE,
+        "tp_observed_source": "VTPK",
+        "energy_period_source": "VTM10",
+        "water_depth_source": ("Copernicus wave-product static deptho at same support node"),
+        "canonical_LAT_bathymetry_used_in_orbital_calculation": False,
+        "method": "Soulsby & Smallman irregular-wave spectral approximation",
+        "equations": (
+            "Tn = sqrt(h/g); t = Tn/Tz; A = [6500 + (0.56 + 15.54*t)^6]^(1/6); "
+            "Urms = 0.25*Hs / [Tn * (1 + A*t^2)^3]; "
+            "equivalent_amplitude = sqrt(2)*Urms; "
+            "equivalent_peak_period = 1.28*Tz"
+        ),
+        "calibration_domain": f"0 <= sqrt(h/g)/Tz <= {wave_orbital.CALIBRATION_DOMAIN_MAX_T}",
+        "calibration_domain_semantics": ("METHOD_ACCURACY_DOMAIN_NOT_UNIVERSAL_PHYSICAL_THRESHOLD"),
+        "equivalent_amplitude_definition": "sqrt(2) * Urms",
+        "equivalent_peak_period_definition": "1.28 * Tz",
+        "equivalent_peak_period_is_diagnostic_not_observed_tp": True,
+        "current_effect_on_wave_dispersion_applied": False,
+        "wave_current_bottom_boundary_layer_applied": False,
+        "directional_spreading_correction_applied": False,
+        "nonbreaking_wave_assumption_applied": True,
+        "explicit_breaking_wave_classifier_applied": False,
+        "source_grid_resolution_note": wave_orbital_map.SOURCE_GRID_RESOLUTION_NOTE,
+        "map_colour_variable": "orbital_rms_p95_m_s",
+        "limitations": [
+            "The Soulsby & Smallman approximation is only accepted within its own "
+            "calibration domain (t <= 0.54) -- a method accuracy domain, not a universal "
+            "physical threshold.",
+            "Non-breaking waves are assumed; no breaking-wave classifier is applied here.",
+            "Wave-current interaction and bed shear stress are not modelled in this ticket.",
+            "The equivalent amplitude and equivalent peak period are derived helpers, "
+            "never more canonical than Urms/observed Tp respectively.",
+            "Wave model bathymetry and canonical MAR-006 LAT bathymetry remain "
+            "deliberately unharmonised; only wave model bathymetry is used here.",
+        ],
+        "references": [
+            {
+                "citation": (
+                    "Soulsby, R.L. (2006). Simplified calculation of wave orbital "
+                    "velocities. HR Wallingford Report TR155."
+                )
+            },
+            {
+                "citation": (
+                    "Soulsby, R.L. & Smallman, J.V. (1986). A direct method of "
+                    "calculating bottom orbital velocity under waves. Hydraulics "
+                    "Research Report SR76."
+                )
+            },
+            {
+                "citation": (
+                    "Wiberg, P.L. & Sherwood, C.R. (2008). Calculating wave-generated "
+                    "bottom orbital velocities from surface-wave parameters. Computers "
+                    "& Geosciences 34, 1243-1262."
+                ),
+                "doi": "10.1016/j.cageo.2008.02.010",
+            },
+            {
+                "citation": (
+                    "Wilson, R.J. et al. (2018). A synthetic map of the north-west "
+                    "European Shelf sedimentary environment for applications in marine "
+                    "science. Earth System Science Data 10, 109-130."
+                ),
+                "doi": "10.5194/essd-10-109-2018",
+            },
+            {"citation": "Copernicus Marine: NWSHELF_REANALYSIS_WAV_004_015 PUM / QUID."},
+        ],
+        "vertical_domain_summary": domain_summary,
+        "outputs": {
+            "wave_orbital_velocity_3hourly": str(hourly_path),
+            "wave_orbital_velocity_stats": str(stats_path),
+            "wave_orbital_reference_segments": str(segments_path),
+            "wave_orbital_map_png": str(png_path),
+        },
+    }
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+
+    print(f"Wave orbital velocity (3-hourly): {len(hourly_orbital_df)} row(s) -> {hourly_path}")
+    print(f"Wave orbital velocity (stats): {len(stats_df)} row(s) -> {stats_path}")
+    print(f"Wave orbital reference segments: {len(segments_gdf)} section(s) -> {segments_path}")
+    print(f"Wave orbital map: {png_path}")
+    print(f"Metadata: {metadata_path}")
+    print()
+    wave_orbital_map.print_wave_orbital_report(
+        domain_summary=domain_summary,
+        stats_df=stats_df,
+        segments_gdf=segments_gdf,
+        route_used_node_count=len(stats_df),
+        distance_diagnostics=distance_diagnostics,
+        segments_path=segments_path,
+        png_path=png_path,
+        png_dimensions=png_dimensions,
+    )
+    return 0
+
+
 def _dataset_start_or(time_range_ms: tuple | None, fallback_now: datetime) -> datetime:
     """The live dataset's own start timestamp, or `fallback_now` if it could not be discovered."""
 
@@ -2154,6 +2404,19 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_current_normalization_parser.set_defaults(func=_cmd_build_current_normalization)
+
+    build_wave_orbital_forcing_parser = subparsers.add_parser(
+        "build-wave-orbital-forcing",
+        help=(
+            "Build the wave-only spectral near-bed orbital velocity (MAR-011, Soulsby & "
+            "Smallman) and render the wave-orbital reference map -- no network, requires "
+            "build-metocean-evidence to have already run."
+        ),
+    )
+    build_wave_orbital_forcing_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_wave_orbital_forcing_parser.set_defaults(func=_cmd_build_wave_orbital_forcing)
 
     return parser
 

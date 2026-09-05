@@ -572,3 +572,64 @@ otherwise, never an interactive credential prompt.
   Shields parameter, sediment mobility, scour, free-span, erosion/
   deposition, or risk scoring is computed anywhere in this ticket -- no
   further ticket has started.
+- `MAR-011`: wave-only spectral near-bed orbital velocity
+  (`metocean/{wave_orbital,wave_orbital_map}.py`) -- converts the MAR-009B
+  canonical wave evidence into a near-bed orbital-velocity forcing product
+  using the FIXED Soulsby & Smallman irregular-wave spectral approximation
+  (`Tn = sqrt(h/g)`, `t = Tn/Tz`, `A = [6500 + (0.56 + 15.54*t)^6]^(1/6)`,
+  `Urms = 0.25*Hs / [Tn*(1+A*t^2)^3]`). Canonical role name
+  `WAVE_ONLY_SPECTRAL_NEAR_BED_ORBITAL_VELOCITY` throughout -- never "bed
+  current"/"combined wave-current velocity"/"bed shear stress". `Tz` is
+  always Copernicus `VTM02` (`tm02_s`) -- changing observed `VTPK`
+  (`tp_s`, preserved as a diagnostic) or `VTM10` (`tm10_s`, preserved as
+  context) alone never changes the canonical Urms, confirmed by dedicated
+  regression tests. Water depth `h` comes from the WAVE product's own
+  static `deptho` at the same real wave support node -- never the
+  canonical MAR-006 LAT depth, never a current-product bathymetry
+  substitute, and no current data are read anywhere in this ticket. Every
+  row also carries an explicitly-named `orbital_velocity_method_status`
+  against a 0.30->0.54 method-accuracy calibration domain (never called a
+  universal physical threshold) -- rows outside it keep their raw
+  Hs/Tm02/Tp/depth values but get null canonical Urms/equivalent
+  amplitude, never a silent out-of-domain extrapolation.
+  `hs_over_model_depth` is reported purely as a non-breaking-assumption QA
+  diagnostic (min/median/p95/p99/max) and never gates/rejects a row. A
+  real edge case worth naming: an exactly-zero depth yields a
+  mathematically finite (not NaN) `Tn`/`t` via plain propagation, which
+  would otherwise slip through as spuriously "within domain" -- caught by
+  an explicit `is_depth_and_period_valid` check before classification, not
+  relied-upon incidental NaN propagation alone.
+
+  Contiguous wave-support map sections
+  (`wave_orbital_reference_segments.gpkg`) mirror MAR-010's honest-
+  spatial-support approach independently (a self-contained module, so
+  MAR-010's already-shipped map is never put at risk by this ticket's
+  changes) -- true route geometry via `shapely.ops.substring`, never 941
+  independently-coloured 25 m cells. The required static map
+  (`maps/pl854_wave_orbital_forcing.png`) colours the route by the
+  assumption-minimal `orbital_rms_p95_m_s` only -- never Hs/Tp/equivalent
+  amplitude/direction/risk -- and applies presentation fixes from the
+  MAR-010 map review: a landscape canvas sized from the TRUE displayed
+  content (route + background raster) rather than the route alone, at
+  most 3 hotspot labels stacked to avoid collisions, and simplified
+  km-precision hotspot KP labels (`KP 6.14-8.16`) rather than the
+  survey-grade `+metres` form still used for the canonical `kp_start`/
+  `kp_end` segment attributes themselves.
+
+  Real execution against PL854 confirms a genuine, expected finding
+  (never hidden): **275,434 of 1,895,264 canonical rows (14.5%) fall
+  outside the 0.54 calibration domain** (Tn/Tz median=0.428, max=1.301) --
+  physically explained by short-period local wind-sea conditions (real
+  Tm02 median 3.93 s) pushing `t` above the method's own accuracy domain;
+  every one of those rows independently verified to retain its raw Hs
+  while its canonical Urms is null, and every within-domain row (with
+  valid Hs) has a real Urms (mean=0.029, p95=0.132, p99=0.238,
+  max=0.717 m/s). Zero duplicate `(wave_node_id, time_utc)` rows, 14
+  route-used wave nodes, 14 contiguous map sections tiling the full
+  23,480.67 m route exactly as MAR-010's current sections did. 45 new
+  offline tests were added across `test_wave_orbital.py`,
+  `test_wave_orbital_map.py`, and `test_cli.py`; the full offline suite
+  (602 tests) and repo-wide `ruff format`/`ruff check` pass clean. No bed
+  shear stress, friction factor, Shields parameter, sediment mobility,
+  erosion/deposition, scour, free-span, or risk scoring is computed
+  anywhere in this ticket -- no further ticket has started.
