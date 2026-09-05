@@ -16,6 +16,8 @@ from shapely.ops import unary_union
 from marine_engine import __version__
 from marine_engine.config import load_study_config
 from marine_engine.metocean import (
+    combined_bed_shear,
+    combined_bed_shear_map,
     current_map,
     current_normalization,
     wave_orbital,
@@ -2357,6 +2359,353 @@ def _cmd_build_wave_orbital_forcing(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_combined_bed_shear(args: argparse.Namespace) -> int:
+    """MAR-012: Soulsby algebraic wave-current bed shear stress sensitivity + map.
+
+    Requires the MAR-010 current normalization and MAR-011A wave orbital
+    outputs to already exist on disk; performs NO network request (Section
+    29) -- everything it reads was already computed by
+    `build-current-normalization` and `build-wave-orbital-forcing`.
+    """
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    pipeline_gpkg_path, _aoi_gpkg_path, _chainage_gpkg_path, interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+    metocean_interim_dir = interim_dir / "metocean"
+    metocean_processed_dir = study_dir / "metocean"
+    maps_dir = study_dir / "maps"
+
+    current_hourly_path = metocean_interim_dir / "current_only_1m_sensitivity_hourly.parquet"
+    current_nodes_path = metocean_interim_dir / "current_primary_support_nodes.parquet"
+    wave_hourly_path = metocean_interim_dir / "wave_orbital_velocity_3hourly.parquet"
+    wave_nodes_path = metocean_interim_dir / "wave_support_nodes.parquet"
+    chainage_metocean_path = metocean_processed_dir / "chainage_metocean_evidence.parquet"
+    required_paths = (
+        pipeline_gpkg_path,
+        current_hourly_path,
+        current_nodes_path,
+        wave_hourly_path,
+        wave_nodes_path,
+        chainage_metocean_path,
+    )
+    missing = [str(p) for p in required_paths if not p.exists()]
+    if missing:
+        print(
+            "error: missing required canonical output(s) -- run build-current-normalization "
+            f"and build-wave-orbital-forcing first: {missing}",
+            file=sys.stderr,
+        )
+        return 1
+
+    working_crs = config.crs.horizontal
+    try:
+        route, _attributes, source_crs = load_pipeline_route(pipeline_gpkg_path, pipeline_id)
+    except InvalidPipelineRouteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if source_crs != working_crs:
+        print(
+            f"error: pipeline CRS {source_crs} does not match configured working CRS {working_crs}",
+            file=sys.stderr,
+        )
+        return 1
+
+    current_hourly_df = pd.read_parquet(current_hourly_path)
+    current_nodes_df = pd.read_parquet(current_nodes_path)
+    wave_hourly_df = pd.read_parquet(wave_hourly_path)
+    wave_nodes_df = pd.read_parquet(wave_nodes_path)
+    chainage_metocean_df = pd.read_parquet(chainage_metocean_path)
+
+    # --- MAR-012 core: spatial reconciliation, exact-time join, physics ----
+    try:
+        hydro_pairs_df = combined_bed_shear.build_hydro_pairs(
+            current_nodes_df, wave_nodes_df, working_crs=working_crs
+        )
+    except combined_bed_shear.UnreconciledHydroNodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    combined_df = combined_bed_shear.build_combined_bed_shear_3hourly(
+        current_hourly_df, wave_hourly_df, hydro_pairs_df
+    )
+
+    try:
+        alignment_summary = combined_bed_shear.compute_temporal_alignment_summary(combined_df)
+        stats_df = combined_bed_shear.compute_combined_bed_shear_stats(combined_df)
+    except combined_bed_shear.CombinedBedShearCompletenessError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    envelope_df = combined_bed_shear.compute_sensitivity_envelope(stats_df)
+
+    overlap_keys_df = combined_df[["wave_node_id", "time_utc"]].drop_duplicates()
+    long_term_stats_df = combined_bed_shear.compute_wave_only_bed_shear_long_term_stats(
+        wave_hourly_df, overlap_keys_df=overlap_keys_df
+    )
+
+    # --- per-hydro-pair reference attributes for segment/map assembly ------
+    overlap_bounds_by_pair = stats_df.drop_duplicates(subset=["hydro_pair_id"]).set_index(
+        "hydro_pair_id"
+    )[["overlap_start_time_utc", "overlap_end_time_utc"]]
+    envelope_by_pair = envelope_df.set_index("hydro_pair_id")
+
+    node_attributes_by_id: dict[str, combined_bed_shear_map.HydroPairReferenceAttributes] = {}
+    for pair_id in hydro_pairs_df["hydro_pair_id"]:
+        envelope_row = envelope_by_pair.loc[pair_id] if pair_id in envelope_by_pair.index else None
+        bounds_row = (
+            overlap_bounds_by_pair.loc[pair_id] if pair_id in overlap_bounds_by_pair.index else None
+        )
+        node_attributes_by_id[pair_id] = combined_bed_shear_map.HydroPairReferenceAttributes(
+            tau_max_p95_sensitivity_min_pa=_none_if_nan(
+                envelope_row["tau_max_p95_sensitivity_min_pa"]
+            )
+            if envelope_row is not None
+            else None,
+            tau_max_p95_sensitivity_max_pa=_none_if_nan(
+                envelope_row["tau_max_p95_sensitivity_max_pa"]
+            )
+            if envelope_row is not None
+            else None,
+            tau_max_p95_sensitivity_width_pa=_none_if_nan(
+                envelope_row["tau_max_p95_sensitivity_width_pa"]
+            )
+            if envelope_row is not None
+            else None,
+            tau_max_p99_sensitivity_min_pa=_none_if_nan(
+                envelope_row["tau_max_p99_sensitivity_min_pa"]
+            )
+            if envelope_row is not None
+            else None,
+            tau_max_p99_sensitivity_max_pa=_none_if_nan(
+                envelope_row["tau_max_p99_sensitivity_max_pa"]
+            )
+            if envelope_row is not None
+            else None,
+            tau_max_p99_sensitivity_width_pa=_none_if_nan(
+                envelope_row["tau_max_p99_sensitivity_width_pa"]
+            )
+            if envelope_row is not None
+            else None,
+            overlap_start_time_utc=bounds_row["overlap_start_time_utc"]
+            if bounds_row is not None
+            else None,
+            overlap_end_time_utc=bounds_row["overlap_end_time_utc"]
+            if bounds_row is not None
+            else None,
+        )
+
+    # --- contiguous map segments (built from current_node_id + wave_node_id) -----
+    chainage_hydro_df = chainage_metocean_df[
+        [
+            "chainage_m",
+            "current_node_id",
+            "current_node_distance_m",
+            "wave_node_id",
+            "wave_node_distance_m",
+        ]
+    ].merge(
+        hydro_pairs_df[["current_node_id", "wave_node_id", "hydro_pair_id"]],
+        on=["current_node_id", "wave_node_id"],
+        how="left",
+    )
+    segments_gdf = combined_bed_shear_map.build_combined_bed_shear_segments(
+        pipeline_id=pipeline_id,
+        route=route,
+        chainage_hydro_df=chainage_hydro_df,
+        node_attributes_by_id=node_attributes_by_id,
+        working_crs=working_crs,
+    )
+
+    pooled_distances_df = pd.concat(
+        [
+            chainage_metocean_df[["current_node_distance_m"]].rename(
+                columns={"current_node_distance_m": "distance_m"}
+            ),
+            chainage_metocean_df[["wave_node_distance_m"]].rename(
+                columns={"wave_node_distance_m": "distance_m"}
+            ),
+        ],
+        ignore_index=True,
+    )
+    distance_diagnostics = metocean_evidence.compute_distance_diagnostics(pooled_distances_df)
+
+    # --- write parquet/gpkg outputs ------------------------------------------
+    combined_hourly_path = metocean_evidence.write_parquet(
+        combined_df, metocean_interim_dir / "combined_bed_shear_3hourly.parquet"
+    )
+    long_term_stats_path = metocean_evidence.write_parquet(
+        long_term_stats_df, metocean_processed_dir / "wave_only_bed_shear_long_term_stats.parquet"
+    )
+    stats_path = metocean_evidence.write_parquet(
+        stats_df, metocean_processed_dir / "combined_bed_shear_stats.parquet"
+    )
+    segments_path = combined_bed_shear_map.write_combined_bed_shear_segments_gpkg(
+        segments_gdf, metocean_processed_dir / "combined_bed_shear_segments.gpkg"
+    )
+
+    background_raster_path = study_dir / "bathymetry" / "emodnet_baseline_lat_100m.tif"
+    png_path = combined_bed_shear_map.render_combined_bed_shear_map(
+        segments_gdf=segments_gdf,
+        route=route,
+        working_crs=working_crs,
+        output_path=maps_dir / "pl854_combined_bed_shear_sensitivity.png",
+        background_raster_path=(
+            background_raster_path if background_raster_path.exists() else None
+        ),
+    )
+    png_dimensions = combined_bed_shear_map.read_png_dimensions(png_path)
+
+    # --- metadata --------------------------------------------------------------
+    metadata_path = metocean_processed_dir / "combined_bed_shear_metadata.json"
+    verified_alignment = (
+        bool((hydro_pairs_df["coordinate_separation_m"] < 1.0).all())
+        if not hydro_pairs_df.empty
+        else None
+    )
+    metadata = {
+        "scientific_role": combined_bed_shear.SCIENTIFIC_ROLE,
+        "interaction_model": combined_bed_shear.INTERACTION_MODEL,
+        "equations": {
+            "current_friction_velocity": "u_star_c = kappa*U_1m / ln((z_target+z0)/z0)",
+            "current_bed_shear_stress": "tau_c_pa = rho * u_star_c^2",
+            "wave_representative_amplitude": "Uw = sqrt(2) * Urms",
+            "wave_representative_period": "T_rep = 1.28 * Tz (VTM02)",
+            "wave_semi_orbital_excursion": "A_wave_m = Uw * T_rep / (2*pi)",
+            "wave_reynolds_number": "Rw = Uw * A_wave / nu",
+            "wave_friction_smooth_laminar_branch": (
+                "f_ws = B*Rw^(-N); B=2.0,N=0.5 (Rw<=5e5); B=0.0521,N=0.187 (Rw>5e5)"
+            ),
+            "wave_friction_rough_branch": "f_wr = 1.39 * (A_wave/z0)^(-0.52)",
+            "wave_friction_factor": "f_w = max(f_ws, f_wr)",
+            "wave_bed_shear_stress": "tau_w_pa = 0.5 * rho * f_w * Uw^2",
+            "soulsby_mean_combined_stress": (
+                "tau_m_pa = tau_c * [1 + 1.2*(tau_w/(tau_c+tau_w))^3.2]"
+            ),
+            "soulsby_max_combined_stress": (
+                "tau_max_pa = sqrt((tau_m+tau_w*cos(phi))^2 + (tau_w*sin(phi))^2)"
+            ),
+        },
+        "rho_water_kg_m3": combined_bed_shear.RHO_WATER_KG_M3,
+        "kinematic_viscosity_m2_s": combined_bed_shear.KINEMATIC_VISCOSITY_M2_S,
+        "von_karman_kappa": combined_bed_shear.VON_KARMAN_KAPPA,
+        "reference_fluid_properties_note": (
+            "Fixed project reference seawater properties for this research calculation -- "
+            "never PL854 in-situ measurements, never a temperature/salinity dependent "
+            "viscosity model."
+        ),
+        "current_reference_height_m": combined_bed_shear.TARGET_HEIGHT_ABOVE_MODEL_BED_M,
+        "current_source": "MAR-010",
+        "wave_source": "MAR-011A",
+        "representative_wave_amplitude": "sqrt(2) * spectral Urms",
+        "representative_wave_period": "1.28 * VTM02",
+        "roughness_scenarios_m": dict(combined_bed_shear.ROUGHNESS_SCENARIOS_M),
+        "roughness_semantics": "SENSITIVITY_SCENARIOS_NOT_SITE_SPECIFIC_BED_TRUTH",
+        "wave_friction_method": (
+            "Soulsby smooth/laminar versus rough branch; maximum branch retained"
+        ),
+        "current_wave_angle_uses_wave_axis_180deg_symmetry": True,
+        "exact_timestamp_inner_join": True,
+        "interpolation_applied": False,
+        "full_grant_madsen_bbl_applied": False,
+        "apparent_wave_enhanced_current_roughness_iterated": False,
+        "current_effect_on_wave_dispersion_applied": False,
+        "shields_parameter_computed": False,
+        "sediment_mobility_computed": False,
+        "map_colour_variable": "tau_max_p95_sensitivity_max_pa",
+        "map_colour_semantics": (
+            "UPPER_BOUND_ACROSS_ROUGHNESS_SENSITIVITY_SCENARIOS_NOT_BEST_ESTIMATE"
+        ),
+        "hydro_pair_reconciliation_method": (
+            "each current support node's coordinate is matched to its nearest wave support "
+            "node's coordinate in the working CRS, within a tolerance of "
+            f"{combined_bed_shear.HYDRO_PAIR_TOLERANCE_FRACTION:.0%} of the current grid's "
+            "own median nearest-neighbour spacing -- never assumed from matching node-id "
+            "strings"
+        ),
+        "hydro_pair_count": int(len(hydro_pairs_df)),
+        "verified_current_wave_coordinate_alignment": verified_alignment,
+        "representativeness_warning": combined_bed_shear.REPRESENTATIVENESS_WARNING,
+        "limitations": [
+            "Roughness scenarios are fixed sensitivity dimensions, not a site-specific "
+            "PL854 seabed roughness estimate.",
+            "This is the Soulsby algebraic wave-current interaction approximation, not a "
+            "full Grant-Madsen iterative bottom-boundary-layer solution.",
+            "Combined statistics are limited to the contemporaneous primary-current/wave "
+            "overlap, not the full 1980-2026 wave record.",
+            "No Shields parameter, critical shear stress, or sediment mobility is computed here.",
+            "Map colours represent the upper p95 bound across roughness scenarios, never a "
+            "best estimate or risk value.",
+        ],
+        "references": [
+            {
+                "citation": "Soulsby, R.L. (1997). Dynamics of Marine Sands.",
+                "doi": "10.1680/doms.25844",
+            },
+            {
+                "citation": (
+                    "Grant, W.D. & Madsen, O.S. (1979). Combined wave and current "
+                    "interaction with a rough bottom. Journal of Geophysical Research "
+                    "84(C4), 1797-1808."
+                ),
+                "doi": "10.1029/JC084iC04p01797",
+            },
+            {
+                "citation": (
+                    "Madsen, O.S. (1994). Spectral wave-current bottom boundary layer "
+                    "flows. Proceedings of the 24th International Conference on Coastal "
+                    "Engineering."
+                ),
+            },
+            {
+                "citation": (
+                    "Soulsby, R.L. (2006). Simplified calculation of wave orbital "
+                    "velocities. HR Wallingford TR155."
+                ),
+            },
+        ],
+        "outputs": {
+            "combined_bed_shear_3hourly": str(combined_hourly_path),
+            "wave_only_bed_shear_long_term_stats": str(long_term_stats_path),
+            "combined_bed_shear_stats": str(stats_path),
+            "combined_bed_shear_segments": str(segments_path),
+            "combined_bed_shear_map_png": str(png_path),
+        },
+    }
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+
+    print(f"Combined bed shear (3-hourly): {len(combined_df)} row(s) -> {combined_hourly_path}")
+    print(
+        f"Wave-only long-term bed shear stats: {len(long_term_stats_df)} row(s) -> "
+        f"{long_term_stats_path}"
+    )
+    print(f"Combined bed shear stats: {len(stats_df)} row(s) -> {stats_path}")
+    print(f"Combined bed shear segments: {len(segments_gdf)} section(s) -> {segments_path}")
+    print(f"Combined bed shear map: {png_path}")
+    print(f"Metadata: {metadata_path}")
+    print()
+    combined_bed_shear_map.print_combined_bed_shear_report(
+        alignment_summary=alignment_summary,
+        hydro_pairs_df=hydro_pairs_df,
+        stats_df=stats_df,
+        envelope_df=envelope_df,
+        long_term_stats_df=long_term_stats_df,
+        segments_gdf=segments_gdf,
+        segments_path=segments_path,
+        png_path=png_path,
+        png_dimensions=png_dimensions,
+        distance_diagnostics=distance_diagnostics,
+    )
+    return 0
+
+
 def _dataset_start_or(time_range_ms: tuple | None, fallback_now: datetime) -> datetime:
     """The live dataset's own start timestamp, or `fallback_now` if it could not be discovered."""
 
@@ -2508,6 +2857,19 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_wave_orbital_forcing_parser.set_defaults(func=_cmd_build_wave_orbital_forcing)
+
+    build_combined_bed_shear_parser = subparsers.add_parser(
+        "build-combined-bed-shear",
+        help=(
+            "Build the Soulsby algebraic wave-current bed shear stress sensitivity "
+            "(MAR-012) and render the combined bed-shear map -- no network, requires "
+            "build-current-normalization and build-wave-orbital-forcing to have already run."
+        ),
+    )
+    build_combined_bed_shear_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_combined_bed_shear_parser.set_defaults(func=_cmd_build_combined_bed_shear)
 
     return parser
 

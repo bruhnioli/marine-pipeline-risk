@@ -1438,3 +1438,263 @@ def test_build_wave_orbital_forcing_command_fails_hard_on_non_monotonic_node_ser
     assert exit_code == 1
     err = capsys.readouterr().err
     assert "temporal integrity" in err
+
+
+# --- build-combined-bed-shear (MAR-012) ----------------------------------------------
+
+
+def test_build_combined_bed_shear_command_requires_pipeline_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "no_pipeline.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-combined-bed-shear", str(config_path)])
+
+    assert exit_code == 1
+    assert "pipeline.pipeline_id" in capsys.readouterr().err
+
+
+def test_build_combined_bed_shear_command_requires_prior_outputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Section 3: must require the MAR-010 + MAR-011A canonical outputs already exist."""
+
+    processed_dir = tmp_path / "processed"
+    interim_dir = tmp_path / "interim"
+    config_path = tmp_path / "study.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n"
+        f"paths:\n  processed_dir: {processed_dir}\n  interim_dir: {interim_dir}\n"
+        "pipeline:\n  pipeline_id: PL854\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-combined-bed-shear", str(config_path)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "build-current-normalization" in err
+    assert "build-wave-orbital-forcing" in err
+
+
+def _write_combined_bed_shear_fixture(tmp_path: Path, *, wave_node_offset_m: float = 0.0) -> Path:
+    """A minimal on-disk study with real MAR-010/MAR-011A-shaped canonical outputs.
+
+    Current and wave support nodes share IDENTICAL coordinates for
+    (current_A, wave_A) and (current_B, wave_B) by default -- real PL854's
+    own verified situation. `wave_node_offset_m` (in degrees longitude) can
+    push wave_B far away to exercise the hard-fail reconciliation path.
+    """
+
+    processed_dir = tmp_path / "processed"
+    interim_dir = tmp_path / "interim"
+    config_path = tmp_path / "study.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n"
+        f"paths:\n  processed_dir: {processed_dir}\n  interim_dir: {interim_dir}\n"
+        "pipeline:\n  pipeline_id: PL854\n",
+        encoding="utf-8",
+    )
+
+    study_dir = processed_dir / "pl854"
+    metocean_interim_dir = interim_dir / "pl854" / "metocean"
+    metocean_processed_dir = study_dir / "metocean"
+    study_dir.mkdir(parents=True, exist_ok=True)
+    metocean_interim_dir.mkdir(parents=True, exist_ok=True)
+    metocean_processed_dir.mkdir(parents=True, exist_ok=True)
+
+    route = LineString([(500000.0, 5900000.0), (500500.0, 5900000.0), (501000.0, 5900300.0)])
+    pipeline_gdf = gpd.GeoDataFrame(
+        [{"pipeline_id": "PL854", "source": "test", "status": "ACTIVE"}],
+        geometry=[route],
+        crs="EPSG:32631",
+    )
+    pipeline_gdf.to_file(study_dir / "pipeline.gpkg", driver="GPKG", layer="pipeline")
+
+    current_nodes_df = pd.DataFrame(
+        [
+            {
+                "node_id": "current_A",
+                "longitude": 1.666667,
+                "latitude": 53.364861,
+                "model_bathymetry_m": 26.0,
+            },
+            {
+                "node_id": "current_B",
+                "longitude": 1.696970,
+                "latitude": 53.364861,
+                "model_bathymetry_m": 29.0,
+            },
+        ]
+    )
+    current_nodes_df.to_parquet(metocean_interim_dir / "current_primary_support_nodes.parquet")
+
+    wave_nodes_df = pd.DataFrame(
+        [
+            {
+                "node_id": "wave_A",
+                "longitude": 1.666667,
+                "latitude": 53.364861,
+                "model_bathymetry_m": 26.0,
+            },
+            {
+                "node_id": "wave_B",
+                "longitude": 1.696970 + wave_node_offset_m,
+                "latitude": 53.364861,
+                "model_bathymetry_m": 29.0,
+            },
+        ]
+    )
+    wave_nodes_df.to_parquet(metocean_interim_dir / "wave_support_nodes.parquet")
+
+    current_times = pd.date_range("2025-01-01", periods=9, freq="h", tz="UTC")
+    from marine_engine.metocean.combined_bed_shear import ROUGHNESS_SCENARIOS_M
+
+    current_rows = []
+    for node_id in ("current_A", "current_B"):
+        for t in current_times:
+            for scenario, z0 in ROUGHNESS_SCENARIOS_M:
+                current_rows.append(
+                    {
+                        "current_node_id": node_id,
+                        "time_utc": t,
+                        "roughness_scenario": scenario,
+                        "z0_m": z0,
+                        "current_only_1m_uo_m_s": 0.4,
+                        "current_only_1m_vo_m_s": 0.1,
+                        "current_only_1m_speed_m_s": float((0.4**2 + 0.1**2) ** 0.5),
+                    }
+                )
+    pd.DataFrame(current_rows).to_parquet(
+        metocean_interim_dir / "current_only_1m_sensitivity_hourly.parquet"
+    )
+
+    wave_times = pd.date_range("2025-01-01", periods=3, freq="3h", tz="UTC")
+    wave_rows = []
+    for node_id in ("wave_A", "wave_B"):
+        for t in wave_times:
+            wave_rows.append(
+                {
+                    "wave_node_id": node_id,
+                    "time_utc": t,
+                    "wave_orbital_velocity_rms_near_bed_m_s": 0.2,
+                    "wave_orbital_velocity_equivalent_amplitude_m_s": float(2.0**0.5 * 0.2),
+                    "equivalent_peak_period_from_tz_s": 1.28 * 6.0,
+                    "tp_s": 8.0,
+                    "wave_mean_direction_to_deg": 90.0,
+                }
+            )
+    pd.DataFrame(wave_rows).to_parquet(
+        metocean_interim_dir / "wave_orbital_velocity_3hourly.parquet"
+    )
+
+    chainage_df = pd.DataFrame(
+        {
+            "chainage_m": [0.0, 500.0, 1000.0, 1500.0],
+            "current_node_id": ["current_A", "current_A", "current_B", "current_B"],
+            "current_node_distance_m": [50.0, 60.0, 70.0, 80.0],
+            "wave_node_id": ["wave_A", "wave_A", "wave_B", "wave_B"],
+            "wave_node_distance_m": [55.0, 65.0, 75.0, 85.0],
+        }
+    )
+    chainage_df.to_parquet(metocean_processed_dir / "chainage_metocean_evidence.parquet")
+
+    return config_path
+
+
+def test_build_combined_bed_shear_command_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_combined_bed_shear_fixture(tmp_path)
+
+    exit_code = main(["build-combined-bed-shear", str(config_path)])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "MAP COLOURS REPRESENT THE UPPER P95 BOUND" in output
+    assert "MAR-012 COMPUTES HYDRODYNAMIC BED SHEAR STRESS ONLY" in output
+    assert "COMBINED BED-SHEAR STATISTICS ARE BASED ON THE CONTEMPORANEOUS" in output
+
+    processed_dir = tmp_path / "processed" / "pl854"
+    interim_dir = tmp_path / "interim" / "pl854"
+    combined_hourly_path = interim_dir / "metocean" / "combined_bed_shear_3hourly.parquet"
+    long_term_stats_path = (
+        processed_dir / "metocean" / "wave_only_bed_shear_long_term_stats.parquet"
+    )
+    stats_path = processed_dir / "metocean" / "combined_bed_shear_stats.parquet"
+    segments_path = processed_dir / "metocean" / "combined_bed_shear_segments.gpkg"
+    png_path = processed_dir / "maps" / "pl854_combined_bed_shear_sensitivity.png"
+    metadata_path = processed_dir / "metocean" / "combined_bed_shear_metadata.json"
+
+    for path in (
+        combined_hourly_path,
+        long_term_stats_path,
+        stats_path,
+        segments_path,
+        png_path,
+        metadata_path,
+    ):
+        assert path.exists(), path
+
+    combined_df = pd.read_parquet(combined_hourly_path)
+    # 3 shared 3-hourly timestamps x 2 hydro pairs x 5 scenarios.
+    assert len(combined_df) == 3 * 2 * 5
+    assert set(combined_df["roughness_scenario"].unique()) == {
+        "SILT",
+        "FINE_SAND",
+        "MEDIUM_SAND",
+        "COARSE_SAND",
+        "GRAVEL",
+    }
+    assert (combined_df["tau_current_pa"] > 0).all()
+    assert (combined_df["tau_wave_pa"] > 0).all()
+
+    stats_df = pd.read_parquet(stats_path)
+    assert set(stats_df["hydro_pair_id"].unique()) == {"current_A__wave_A", "current_B__wave_B"}
+
+    segments_gdf = gpd.read_file(segments_path, layer="combined_bed_shear_segments")
+    assert len(segments_gdf) == 2  # one contiguous section per hydro pair
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["scientific_role"] == "SOULSBY_ALGEBRAIC_WAVE_CURRENT_BED_SHEAR_SENSITIVITY"
+    assert metadata["interaction_model"] == "SOULSBY_ALGEBRAIC_WAVE_CURRENT_BED_SHEAR"
+    assert metadata["full_grant_madsen_bbl_applied"] is False
+    assert metadata["shields_parameter_computed"] is False
+    assert metadata["sediment_mobility_computed"] is False
+    assert metadata["verified_current_wave_coordinate_alignment"] is True
+    assert png_path.stat().st_size > 0
+
+
+def test_build_combined_bed_shear_command_is_idempotent_offline(tmp_path: Path) -> None:
+    """No network/Copernicus dependency -- running twice against the same fixture succeeds."""
+
+    config_path = _write_combined_bed_shear_fixture(tmp_path)
+
+    first_exit_code = main(["build-combined-bed-shear", str(config_path)])
+    second_exit_code = main(["build-combined-bed-shear", str(config_path)])
+
+    assert first_exit_code == 0
+    assert second_exit_code == 0
+
+
+def test_build_combined_bed_shear_command_hard_fails_on_unreconcilable_coordinates(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Section 19/30-Q: a wave node with no coordinate-matching current node partner
+    must hard fail the whole run, never silently pair it with a distant cell."""
+
+    config_path = _write_combined_bed_shear_fixture(tmp_path, wave_node_offset_m=5.0)
+
+    exit_code = main(["build-combined-bed-shear", str(config_path)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert (
+        "coordinate tolerance" in err
+        or "UnreconciledHydroNodeError" in err
+        or "unrelated grid cells" in err
+    )

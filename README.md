@@ -677,3 +677,76 @@ otherwise, never an interactive credential prompt.
   interaction, bed shear stress, friction factor, Shields parameter,
   sediment mobility, or risk scoring is computed anywhere in this ticket --
   no further ticket has started.
+- `MAR-012`: combines the accepted MAR-010 current-only 1 m normalization and
+  MAR-011A spectral wave orbital velocity into a contemporaneous wave-current
+  bed-shear-stress sensitivity product (`metocean/{combined_bed_shear,
+  combined_bed_shear_map}.py`), using the SOULSBY ALGEBRAIC interaction
+  approximation only -- never a full Grant-Madsen iterative BBL solution,
+  never an iterated apparent wave-enhanced roughness, never a wave-dispersion
+  correction (`interaction_model = SOULSBY_ALGEBRAIC_WAVE_CURRENT_BED_SHEAR`,
+  `full_grant_madsen_bbl_applied = false`). Current-only stress inverts
+  MAR-010's own log-profile at the SAME z0 (`u_star_c = kappa*U_1m /
+  ln((1+z0)/z0)`, `tau_c = rho*u_star_c^2`); wave-only stress uses the
+  MAR-011A equivalent amplitude (`sqrt(2)*Urms`, never raw Urms) and
+  representative period (`1.28*Tz`, never observed VTPK) through competing
+  smooth/laminar (`Rw<=5e5`) and rough friction-factor branches, with the
+  canonical factor always the MAX of the two (never their average); Soulsby's
+  algebraic mean/max combined-stress formulas fold in the current/wave axis
+  angle (minimal 0..180 difference, folded around 90 to exploit the wave
+  axis's own 180-degree symmetry). All five MAR-010 roughness scenarios are
+  reused exactly (never re-chosen, never averaged), and the SAME scenario z0
+  is used for current and wave stress within a row. A real edge case handled
+  explicitly rather than left to bare IEEE-754 arithmetic: phi is
+  deliberately null for zero current (avoiding the spurious `atan2(0,0)==0`
+  direction), so `compute_soulsby_max_combined_stress_pa` explicitly branches
+  on `tau_c==0`/`tau_w==0` rather than trusting `0 * NaN` to resolve to `0`.
+
+  Two previously-independent real-world grids are reconciled by COORDINATE,
+  never assumed identical by node-id string equality (Section 19's own
+  explicit "this must be VERIFIED" instruction): `build_hydro_pairs`
+  projects both products' stored lon/lat into the working CRS and matches
+  nearest cells within a tolerance derived from the current grid's own
+  median nearest-neighbour spacing, hard-failing
+  (`UnreconciledHydroNodeError`) rather than silently pairing an
+  out-of-tolerance cell. The combined 3-hourly series
+  (`combined_bed_shear_3hourly.parquet`) is built from an EXACT-timestamp
+  inner join between the hourly current and 3-hourly wave series (after
+  spatial pairing) -- never combining independent percentile statistics,
+  never interpolating. Long-term wave-only bed-shear context is computed
+  separately from the FULL 1980-2026 wave record
+  (`wave_only_bed_shear_long_term_stats.parquet`), with an
+  overlap-vs-full-record p95 ratio reported strictly as REPRESENTATIVENESS
+  CONTEXT, never a confidence score. The required map
+  (`maps/pl854_combined_bed_shear_sensitivity.png`) colours the route by
+  `tau_max_p95_sensitivity_max_pa` -- deliberately the UPPER BOUND across the
+  five roughness scenarios, never a best estimate -- with hotspot labels
+  showing the FULL p95 envelope (e.g. `p95 0.47-1.04 Pa`), never just the
+  upper value.
+
+  Real execution against PL854 (no network) VERIFIED, not assumed, that the
+  current and wave products share the identical AMM15 support grid: all 14
+  current/wave node pairs reconciled with coordinate separation exactly
+  0.000000 m. The current-wave overlap runs 2024-07-20 03:00 to 2026-04-30
+  21:00 UTC (5,199 expected/matched 3-hour timestamps, 100% completeness),
+  producing 363,930 combined rows (5,199 timestamps x 14 hydro pairs x 5
+  scenarios) and 14 contiguous map sections tiling the full 23,480.67 m
+  route exactly as MAR-010/011's own sections did. A genuine, unforced
+  finding: within this specific ~21-month overlap window, the wave Reynolds
+  number never exceeded the 5e5 laminar/smooth-turbulent transition (max
+  observed ~305,246, hand-verified against the raw amplitude/period columns)
+  -- every row falls in `LAMINAR_BRANCH`, while the ROUGH friction branch
+  still independently controls ~20% of rows (73,027 / 363,930) since the two
+  branches are compared independently of that regime label. Stresses
+  increase monotonically with roughness across all five scenarios for both
+  components (GRAVEL always largest, SILT/FINE_SAND always smallest;
+  confirmed as the most/least frequent p95-minimising/maximising scenario
+  across all 14 segments) -- a physically-expected, non-random pattern. The
+  overlap-period wave-only tau p95 (0.904 Pa) runs modestly above the
+  full-record p95 (0.818 Pa, ratio 1.148), reported as context only, never
+  substituted into the combined statistics. 62 new offline tests were added
+  across `test_combined_bed_shear.py`, `test_combined_bed_shear_map.py`, and
+  `test_cli.py`; the full offline suite (671 tests) and repo-wide `ruff
+  format`/`ruff check` pass clean. MAR-012 computes hydrodynamic bed shear
+  stress only -- no Shields parameter, critical shear stress, sediment
+  mobility, erosion/deposition, scour, free-span, or risk scoring is
+  computed anywhere in this ticket -- no further ticket has started.
