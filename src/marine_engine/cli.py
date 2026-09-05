@@ -897,12 +897,15 @@ def _acquire_chunked_dataset(
     chunk_ranges: list,
     evidence_role: str,
     temporal_resolution: str,
-) -> xr.Dataset | None:
-    """Acquire every chunk (resuming from the manifest), then open+concat them.
+) -> tuple[xr.Dataset | None, metocean_acquisition.TemporalDeduplicationResult | None]:
+    """Acquire every chunk (resuming from the manifest), then open+concat+dedup them.
 
     Never re-downloads a chunk whose exact identity (product/dataset/
     variables/bbox/depths/start/end) is already manifested with its file
-    still on disk (Section 15).
+    still on disk (Section 15). Adjacent chunks can share their boundary
+    instant (Copernicus subset requests are inclusive of `end_datetime`) --
+    `deduplicate_time_coordinate` collapses that overlap here, at chunk
+    assembly, before the dataset is ever normalized (MAR-009B).
     """
 
     requested_bbox = list(bbox_wgs84)
@@ -968,10 +971,13 @@ def _acquire_chunked_dataset(
         chunk_paths.append(result.local_path)
 
     if not chunk_paths:
-        return None
+        return None, None
     if len(chunk_paths) == 1:
-        return xr.open_dataset(chunk_paths[0])
-    return xr.open_mfdataset([str(p) for p in chunk_paths], combine="by_coords")
+        ds = xr.open_dataset(chunk_paths[0])
+    else:
+        ds = xr.open_mfdataset([str(p) for p in chunk_paths], combine="by_coords")
+    deduped_ds, dedup_result = metocean_acquisition.deduplicate_time_coordinate(ds)
+    return deduped_ds, dedup_result
 
 
 def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
@@ -1155,11 +1161,6 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
     old_primary_current_df = _read_existing_parquet(
         metocean_interim_dir / "current_primary_hourly.parquet"
     )
-    old_current_stats = (
-        metocean_evidence.compute_current_node_statistics(old_primary_current_df)
-        if not old_primary_current_df.empty
-        else pd.DataFrame()
-    )
     # The node-count regression this ticket fixes (Section 7/8) shows up in
     # the TIME SERIES files (every wet bbox cell was normalized), not the
     # support-node table (already correctly used-only via
@@ -1168,6 +1169,42 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
     old_wave_df = _read_existing_parquet(metocean_interim_dir / "wave_3hourly.parquet")
     old_long_term_current_df = _read_existing_parquet(
         metocean_interim_dir / "current_long_term_surface_hourly.parquet"
+    )
+
+    def _safe_old_stats(compute_fn, df: pd.DataFrame, label: str) -> pd.DataFrame:
+        """Old (pre-fix) stats for the comparison report only -- never load-bearing.
+
+        The OLD on-disk data predates MAR-009B's chunk-boundary dedup, so it
+        can itself trip the new strict completeness check
+        (`TemporalCompletenessError`) -- that is an expected, informative
+        outcome (it demonstrates the pre-fix defect), not a reason to abort
+        this run. Only the NEW canonical computation must remain a hard
+        failure.
+        """
+
+        if df.empty:
+            return pd.DataFrame()
+        try:
+            return compute_fn(df)
+        except metocean_evidence.TemporalCompletenessError:
+            print(
+                f"note: old (pre-fix) {label} data itself exceeds 100% completeness "
+                "(the exact defect this ticket fixes) -- old comparison values for "
+                f"{label} are reported as unavailable rather than computed",
+                file=sys.stderr,
+            )
+            return pd.DataFrame()
+
+    old_current_stats = _safe_old_stats(
+        metocean_evidence.compute_current_node_statistics, old_primary_current_df, "primary current"
+    )
+    old_wave_stats = _safe_old_stats(
+        metocean_evidence.compute_wave_node_statistics, old_wave_df, "wave"
+    )
+    old_long_term_stats = _safe_old_stats(
+        metocean_evidence.compute_long_term_surface_current_statistics,
+        old_long_term_current_df,
+        "long-term surface current",
     )
 
     # --- primary current acquisition (Section 6, 15) ---------------------
@@ -1179,18 +1216,22 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
         ),
         historical_cutoff,
     )
-    primary_current_ds = _acquire_chunked_dataset(
-        manifest_path=manifest_path,
-        raw_dir=raw_dir / "current_primary",
-        product_id=copernicus.PRIMARY_CURRENT_PRODUCT_ID,
-        dataset_id=primary_current_dataset_id,
-        variables=list(copernicus.PRIMARY_CURRENT_VARIABLES),
-        bbox_wgs84=aoi_bbox_wgs84,
-        depth_range=None,
-        chunk_ranges=primary_chunk_ranges,
-        evidence_role=copernicus.PRIMARY_CURRENT_EVIDENCE_ROLE,
-        temporal_resolution="hourly_instantaneous",
-    )
+    try:
+        primary_current_ds, primary_temporal_dedup = _acquire_chunked_dataset(
+            manifest_path=manifest_path,
+            raw_dir=raw_dir / "current_primary",
+            product_id=copernicus.PRIMARY_CURRENT_PRODUCT_ID,
+            dataset_id=primary_current_dataset_id,
+            variables=list(copernicus.PRIMARY_CURRENT_VARIABLES),
+            bbox_wgs84=aoi_bbox_wgs84,
+            depth_range=None,
+            chunk_ranges=primary_chunk_ranges,
+            evidence_role=copernicus.PRIMARY_CURRENT_EVIDENCE_ROLE,
+            temporal_resolution="hourly_instantaneous",
+        )
+    except metocean_acquisition.DuplicateTimestampConflictError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     static_depth_mask_used = False
     static_mask_by_node_id: dict[str, np.ndarray] | None = None
@@ -1240,18 +1281,22 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
     long_term_chunk_ranges = metocean_acquisition.generate_yearly_chunks(
         _dataset_start_or(long_term_start_ms, now_utc), historical_cutoff
     )
-    long_term_current_ds = _acquire_chunked_dataset(
-        manifest_path=manifest_path,
-        raw_dir=raw_dir / "current_long_term_surface",
-        product_id=copernicus.LONG_TERM_CURRENT_PRODUCT_ID,
-        dataset_id=long_term_current_dataset_id,
-        variables=list(copernicus.LONG_TERM_CURRENT_VARIABLES),
-        bbox_wgs84=aoi_bbox_wgs84,
-        depth_range=None,
-        chunk_ranges=long_term_chunk_ranges,
-        evidence_role=copernicus.LONG_TERM_SURFACE_CURRENT_CONTEXT_ROLE,
-        temporal_resolution="hourly_instantaneous",
-    )
+    try:
+        long_term_current_ds, long_term_temporal_dedup = _acquire_chunked_dataset(
+            manifest_path=manifest_path,
+            raw_dir=raw_dir / "current_long_term_surface",
+            product_id=copernicus.LONG_TERM_CURRENT_PRODUCT_ID,
+            dataset_id=long_term_current_dataset_id,
+            variables=list(copernicus.LONG_TERM_CURRENT_VARIABLES),
+            bbox_wgs84=aoi_bbox_wgs84,
+            depth_range=None,
+            chunk_ranges=long_term_chunk_ranges,
+            evidence_role=copernicus.LONG_TERM_SURFACE_CURRENT_CONTEXT_ROLE,
+            temporal_resolution="hourly_instantaneous",
+        )
+    except metocean_acquisition.DuplicateTimestampConflictError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     unreconciled_long_term_node_ids: list[str] = []
     long_term_current_df = pd.DataFrame()
@@ -1277,18 +1322,22 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
     wave_chunk_ranges = metocean_acquisition.generate_yearly_chunks(
         _dataset_start_or(wave_start_ms, now_utc), historical_cutoff
     )
-    wave_ds = _acquire_chunked_dataset(
-        manifest_path=manifest_path,
-        raw_dir=raw_dir / "wave_reanalysis",
-        product_id=copernicus.WAVE_PRODUCT_ID,
-        dataset_id=wave_dataset_id,
-        variables=list(copernicus.WAVE_VARIABLES),
-        bbox_wgs84=aoi_bbox_wgs84,
-        depth_range=None,
-        chunk_ranges=wave_chunk_ranges,
-        evidence_role=copernicus.PRIMARY_WAVE_CLIMATE_ROLE,
-        temporal_resolution="3hourly_instantaneous",
-    )
+    try:
+        wave_ds, wave_temporal_dedup = _acquire_chunked_dataset(
+            manifest_path=manifest_path,
+            raw_dir=raw_dir / "wave_reanalysis",
+            product_id=copernicus.WAVE_PRODUCT_ID,
+            dataset_id=wave_dataset_id,
+            variables=list(copernicus.WAVE_VARIABLES),
+            bbox_wgs84=aoi_bbox_wgs84,
+            depth_range=None,
+            chunk_ranges=wave_chunk_ranges,
+            evidence_role=copernicus.PRIMARY_WAVE_CLIMATE_ROLE,
+            temporal_resolution="3hourly_instantaneous",
+        )
+    except metocean_acquisition.DuplicateTimestampConflictError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     unreconciled_wave_node_ids: list[str] = []
     wave_df = pd.DataFrame()
@@ -1305,11 +1354,15 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
             )
 
     # --- descriptive statistics (Sections 24, 25, 27) ---------------------
-    current_stats = metocean_evidence.compute_current_node_statistics(primary_current_df)
-    long_term_stats = metocean_evidence.compute_long_term_surface_current_statistics(
-        long_term_current_df
-    )
-    wave_stats = metocean_evidence.compute_wave_node_statistics(wave_df)
+    try:
+        current_stats = metocean_evidence.compute_current_node_statistics(primary_current_df)
+        long_term_stats = metocean_evidence.compute_long_term_surface_current_statistics(
+            long_term_current_df
+        )
+        wave_stats = metocean_evidence.compute_wave_node_statistics(wave_df)
+    except metocean_evidence.TemporalCompletenessError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     annual_max_hs = metocean_evidence.compute_annual_max_hs(wave_df)
 
     primary_start = primary_current_df["time_utc"].min() if not primary_current_df.empty else None
@@ -1328,6 +1381,49 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
         long_term_mapping
     )
     wave_distance_diagnostics = metocean_evidence.compute_distance_diagnostics(wave_mapping)
+
+    # --- temporal integrity QA (MAR-009B, Sections 4, 5) -------------------
+    # Merges the chunk-assembly-level dedup diagnostics (raw/unique/removed
+    # timestamp counts, identical for every node of a product since they
+    # share one dynamic time axis) with a defensive post-normalization
+    # re-check (unique/monotonic/no-duplicate-rows) -- reported separately
+    # for all three products, never folded together.
+    def _temporal_qa(
+        dedup_result: metocean_acquisition.TemporalDeduplicationResult | None,
+        df: pd.DataFrame,
+        *,
+        time_column: str,
+        node_column: str,
+    ) -> dict[str, Any]:
+        qa: dict[str, Any] = {
+            "raw_time_count": dedup_result.raw_time_count if dedup_result else None,
+            "unique_time_count": dedup_result.unique_time_count if dedup_result else None,
+            "duplicate_boundary_timestamp_count": (
+                dedup_result.duplicate_boundary_timestamp_count if dedup_result else None
+            ),
+        }
+        qa.update(
+            metocean_evidence.validate_temporal_integrity(
+                df, time_column=time_column, node_column=node_column
+            )
+        )
+        return qa
+
+    primary_temporal_qa = _temporal_qa(
+        primary_temporal_dedup,
+        primary_current_df,
+        time_column="time_utc",
+        node_column="current_node_id",
+    )
+    long_term_temporal_qa = _temporal_qa(
+        long_term_temporal_dedup,
+        long_term_current_df,
+        time_column="time_utc",
+        node_column="current_lt_node_id",
+    )
+    wave_temporal_qa = _temporal_qa(
+        wave_temporal_dedup, wave_df, time_column="time_utc", node_column="wave_node_id"
+    )
 
     long_term_node_table = metocean_evidence.build_support_node_table(
         long_term_nodes,
@@ -1479,6 +1575,11 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
                 ),
             },
             "only_chainage_used_support_nodes_normalized": True,
+            "temporal_qa": {
+                "primary_current": primary_temporal_qa,
+                "long_term_surface_current": long_term_temporal_qa,
+                "wave": wave_temporal_qa,
+            },
             "raw_acquisition_manifest_path": str(manifest_path),
             "limitations": [
                 "primary current record is only the rolling available historical analysis "
@@ -1561,17 +1662,69 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
             else None,
             len(long_term_stats),
         ),
+        "long_term_current_speed_p95_m_s": (
+            float(old_long_term_stats["surface_current_speed_p95_m_s"].max())
+            if not old_long_term_stats.empty
+            else None,
+            float(long_term_stats["surface_current_speed_p95_m_s"].max())
+            if not long_term_stats.empty
+            else None,
+        ),
+        "long_term_current_speed_p99_m_s": (
+            float(old_long_term_stats["surface_current_speed_p99_m_s"].max())
+            if not old_long_term_stats.empty
+            else None,
+            float(long_term_stats["surface_current_speed_p99_m_s"].max())
+            if not long_term_stats.empty
+            else None,
+        ),
+        "long_term_current_speed_max_m_s": (
+            float(old_long_term_stats["surface_current_speed_max_m_s"].max())
+            if not old_long_term_stats.empty
+            else None,
+            float(long_term_stats["surface_current_speed_max_m_s"].max())
+            if not long_term_stats.empty
+            else None,
+        ),
+        "wave_hs_mean_m": (
+            float(old_wave_stats["hs_mean_m"].mean()) if not old_wave_stats.empty else None,
+            float(wave_stats["hs_mean_m"].mean()) if not wave_stats.empty else None,
+        ),
+        "wave_hs_p95_m": (
+            float(old_wave_stats["hs_p95_m"].max()) if not old_wave_stats.empty else None,
+            float(wave_stats["hs_p95_m"].max()) if not wave_stats.empty else None,
+        ),
+        "wave_hs_p99_m": (
+            float(old_wave_stats["hs_p99_m"].max()) if not old_wave_stats.empty else None,
+            float(wave_stats["hs_p99_m"].max()) if not wave_stats.empty else None,
+        ),
+        "wave_hs_max_m": (
+            float(old_wave_stats["hs_max_m"].max()) if not old_wave_stats.empty else None,
+            float(wave_stats["hs_max_m"].max()) if not wave_stats.empty else None,
+        ),
+        "wave_tp_median_s": (
+            float(old_wave_stats["tp_median_s"].median()) if not old_wave_stats.empty else None,
+            float(wave_stats["tp_median_s"].median()) if not wave_stats.empty else None,
+        ),
+        "wave_tp_p95_s": (
+            float(old_wave_stats["tp_p95_s"].max()) if not old_wave_stats.empty else None,
+            float(wave_stats["tp_p95_s"].max()) if not wave_stats.empty else None,
+        ),
     }
 
     metocean_evidence.print_metocean_evidence_report(
         primary_current_stats=current_stats,
         primary_current_route_summary=primary_current_route_summary,
+        primary_current_canonical_row_count=len(primary_current_df),
+        primary_temporal_qa=primary_temporal_qa,
         below_bed_diagnostics=below_bed_diagnostics,
         primary_distance_diagnostics=primary_distance_diagnostics,
         long_term_stats=long_term_stats,
+        long_term_temporal_qa=long_term_temporal_qa,
         long_term_distance_diagnostics=long_term_distance_diagnostics,
         short_window_ratios=short_window_ratios,
         wave_stats=wave_stats,
+        wave_temporal_qa=wave_temporal_qa,
         wave_distance_diagnostics=wave_distance_diagnostics,
         primary_current_actual_start=primary_start,
         primary_current_actual_end=primary_end,

@@ -1,11 +1,17 @@
 """Offline unit tests for marine_engine.providers.metocean.acquisition.
 
-No network access, no xarray -- these operate on locally-written synthetic
-files and in-memory data only.
+No network access -- these operate on locally-written synthetic files and
+small in-memory xarray Datasets only (never the real PL854 Copernicus
+Marine data).
 """
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+import xarray as xr
 
 from marine_engine.providers.metocean import acquisition as acq
 
@@ -283,3 +289,211 @@ def test_isoformat_or_static_sentinel():
 
     assert acq.isoformat_or_static_sentinel(moment) == moment.isoformat()
     assert acq.isoformat_or_static_sentinel(None) == acq.STATIC_TIME_SENTINEL
+
+
+# --- deduplicate_time_coordinate (MAR-009B) -----------------------------------------
+#
+# Synthetic datasets shaped like the three real products -- never the real
+# PL854 data, never network access. Each simulates the real bug: Copernicus
+# subset() is inclusive of `end_datetime`, so two adjacent monthly/yearly
+# acquisition chunks each carry their shared boundary instant, and
+# concatenating them (`xr.open_mfdataset(..., combine="by_coords")`) does
+# not itself deduplicate.
+
+
+def _make_4d_current_dataset(
+    times, uo_values, vo_values, *, depths=(0.0,), latitudes=(53.0,), longitudes=(1.0,)
+) -> xr.Dataset:
+    """Primary-current-shaped (time, depth, latitude, longitude)."""
+
+    return xr.Dataset(
+        {
+            "uo": (("time", "depth", "latitude", "longitude"), uo_values),
+            "vo": (("time", "depth", "latitude", "longitude"), vo_values),
+        },
+        coords={
+            "time": times,
+            "depth": list(depths),
+            "latitude": list(latitudes),
+            "longitude": list(longitudes),
+        },
+    )
+
+
+def _make_surface_current_dataset(
+    times, uo_values, vo_values, *, latitudes=(53.0,), longitudes=(1.0,)
+) -> xr.Dataset:
+    """Long-term-surface-current-shaped (time, latitude, longitude)."""
+
+    return xr.Dataset(
+        {
+            "uo": (("time", "latitude", "longitude"), uo_values),
+            "vo": (("time", "latitude", "longitude"), vo_values),
+        },
+        coords={"time": times, "latitude": list(latitudes), "longitude": list(longitudes)},
+    )
+
+
+def _make_wave_dataset(times, hs_values, *, latitudes=(53.0,), longitudes=(1.0,)) -> xr.Dataset:
+    """Wave-shaped (time, latitude, longitude), real variable name VHM0."""
+
+    return xr.Dataset(
+        {"VHM0": (("time", "latitude", "longitude"), hs_values)},
+        coords={"time": times, "latitude": list(latitudes), "longitude": list(longitudes)},
+    )
+
+
+def test_deduplicate_time_coordinate_noop_when_no_duplicates():
+    times = pd.date_range("2024-07-01", periods=4, freq="h", tz="UTC")
+    shape = (4, 1, 1, 1)
+    ds = _make_4d_current_dataset(times, np.arange(4.0).reshape(shape), np.zeros(shape))
+
+    deduped, result = acq.deduplicate_time_coordinate(ds)
+
+    assert result == acq.TemporalDeduplicationResult(4, 4, 0)
+    assert len(deduped["time"]) == 4
+
+
+def test_deduplicate_time_coordinate_collapses_consistent_monthly_boundary():
+    """Two monthly current chunks sharing exactly one boundary hour, consistent data."""
+
+    times_a = pd.date_range("2024-07-01", periods=4, freq="h", tz="UTC")  # hours 0,1,2,3
+    times_b = pd.date_range("2024-07-01 03:00", periods=4, freq="h", tz="UTC")  # hours 3,4,5,6
+    shape = (4, 1, 1, 1)
+    uo_a = np.array([0.0, 1.0, 2.0, 3.0]).reshape(shape)
+    vo_a = np.array([0.0, 2.0, 4.0, 6.0]).reshape(shape)
+    # chunk_b's hour-3 (its own index 0) must match chunk_a's hour-3 (index 3).
+    uo_b = np.array([3.0, 4.0, 5.0, 6.0]).reshape(shape)
+    vo_b = np.array([6.0, 8.0, 10.0, 12.0]).reshape(shape)
+    chunk_a = _make_4d_current_dataset(times_a, uo_a, vo_a)
+    chunk_b = _make_4d_current_dataset(times_b, uo_b, vo_b)
+    combined = xr.concat([chunk_a, chunk_b], dim="time")
+    assert len(combined["time"]) == 8  # raw, still overlapping
+
+    deduped, result = acq.deduplicate_time_coordinate(combined)
+
+    assert result == acq.TemporalDeduplicationResult(
+        raw_time_count=8, unique_time_count=7, duplicate_boundary_timestamp_count=1
+    )
+    assert len(deduped["time"]) == 7
+    deduped_time_index = pd.Index(deduped["time"].to_numpy())
+    assert deduped_time_index.is_unique
+    assert deduped_time_index.is_monotonic_increasing
+    # The single canonical hour-3 row keeps its (consistent) value, not a duplicate.
+    assert float(deduped["uo"].isel(time=3).to_numpy().item()) == pytest.approx(3.0)
+
+
+def test_deduplicate_time_coordinate_raises_on_inconsistent_monthly_boundary():
+    """Same shape as above, but the two chunks disagree at the shared boundary hour."""
+
+    times_a = pd.date_range("2024-07-01", periods=4, freq="h", tz="UTC")
+    times_b = pd.date_range("2024-07-01 03:00", periods=4, freq="h", tz="UTC")
+    shape = (4, 1, 1, 1)
+    uo_a = np.array([0.0, 1.0, 2.0, 3.0]).reshape(shape)
+    vo_a = np.zeros(shape)
+    uo_b = np.array([999.0, 4.0, 5.0, 6.0]).reshape(shape)  # disagrees with chunk_a's 3.0
+    vo_b = np.zeros(shape)
+    combined = xr.concat(
+        [
+            _make_4d_current_dataset(times_a, uo_a, vo_a),
+            _make_4d_current_dataset(times_b, uo_b, vo_b),
+        ],
+        dim="time",
+    )
+
+    with pytest.raises(acq.DuplicateTimestampConflictError):
+        acq.deduplicate_time_coordinate(combined)
+
+
+def test_deduplicate_time_coordinate_treats_nan_as_equal_to_nan():
+    """A genuinely absent sample at the boundary must not be flagged as a conflict."""
+
+    times_a = pd.date_range("2024-07-01", periods=4, freq="h", tz="UTC")
+    times_b = pd.date_range("2024-07-01 03:00", periods=4, freq="h", tz="UTC")
+    shape = (4, 1, 1, 1)
+    uo_a = np.array([0.0, 1.0, 2.0, np.nan]).reshape(shape)
+    uo_b = np.array([np.nan, 4.0, 5.0, 6.0]).reshape(shape)  # shared hour: NaN in both
+    zeros = np.zeros(shape)
+    combined = xr.concat(
+        [
+            _make_4d_current_dataset(times_a, uo_a, zeros),
+            _make_4d_current_dataset(times_b, uo_b, zeros),
+        ],
+        dim="time",
+    )
+
+    deduped, result = acq.deduplicate_time_coordinate(combined)
+
+    assert result.duplicate_boundary_timestamp_count == 1
+    assert np.isnan(deduped["uo"].isel(time=3).to_numpy().item())
+
+
+def test_deduplicate_time_coordinate_yearly_long_term_current_overlap():
+    """Two yearly long-term-current chunks sharing the Dec31/Jan1 boundary hour."""
+
+    times_2024 = pd.date_range("2024-12-31 22:00", periods=3, freq="h", tz="UTC")
+    times_2025 = pd.date_range("2025-01-01 00:00", periods=3, freq="h", tz="UTC")
+    shape = (3, 1, 1)
+    uo_2024 = np.array([0.1, 0.2, 0.3]).reshape(shape)
+    uo_2025 = np.array([0.3, 0.4, 0.5]).reshape(shape)  # index 0 (Jan 1 00:00) matches 0.3
+    zeros = np.zeros(shape)
+    combined = xr.concat(
+        [
+            _make_surface_current_dataset(times_2024, uo_2024, zeros),
+            _make_surface_current_dataset(times_2025, uo_2025, zeros),
+        ],
+        dim="time",
+    )
+    assert len(combined["time"]) == 6
+
+    deduped, result = acq.deduplicate_time_coordinate(combined)
+
+    assert result == acq.TemporalDeduplicationResult(6, 5, 1)
+    assert len(deduped["time"]) == 5
+    assert pd.Index(deduped["time"].to_numpy()).is_unique
+
+
+def test_deduplicate_time_coordinate_yearly_wave_overlap():
+    """Two yearly wave chunks sharing the Dec31/Jan1 3-hourly boundary step."""
+
+    times_2024 = pd.date_range("2024-12-31 18:00", periods=3, freq="3h", tz="UTC")
+    times_2025 = pd.date_range("2025-01-01 00:00", periods=3, freq="3h", tz="UTC")
+    shape = (3, 1, 1)
+    hs_2024 = np.array([1.0, 1.2, 1.4]).reshape(shape)
+    hs_2025 = np.array([1.4, 1.6, 1.8]).reshape(shape)  # index 0 (Jan 1 00:00) matches 1.4
+    combined = xr.concat(
+        [_make_wave_dataset(times_2024, hs_2024), _make_wave_dataset(times_2025, hs_2025)],
+        dim="time",
+    )
+    assert len(combined["time"]) == 6
+
+    deduped, result = acq.deduplicate_time_coordinate(combined)
+
+    assert result == acq.TemporalDeduplicationResult(6, 5, 1)
+    assert len(deduped["time"]) == 5
+
+
+def test_deduplicate_time_coordinate_sorts_regardless_of_concatenation_order():
+    """Even if chunks were concatenated out of chronological order, output is sorted."""
+
+    times_a = pd.date_range("2024-07-01", periods=4, freq="h", tz="UTC")
+    times_b = pd.date_range("2024-07-01 03:00", periods=4, freq="h", tz="UTC")
+    shape = (4, 1, 1, 1)
+    uo_a = np.array([0.0, 1.0, 2.0, 3.0]).reshape(shape)
+    uo_b = np.array([3.0, 4.0, 5.0, 6.0]).reshape(shape)
+    zeros = np.zeros(shape)
+    # Deliberately reversed concatenation order (chunk_b BEFORE chunk_a).
+    combined = xr.concat(
+        [
+            _make_4d_current_dataset(times_b, uo_b, zeros),
+            _make_4d_current_dataset(times_a, uo_a, zeros),
+        ],
+        dim="time",
+    )
+
+    deduped, result = acq.deduplicate_time_coordinate(combined)
+
+    assert result.duplicate_boundary_timestamp_count == 1
+    deduped_times = pd.Index(deduped["time"].to_numpy())
+    assert deduped_times.is_monotonic_increasing
+    assert list(deduped_times) == sorted(deduped_times)

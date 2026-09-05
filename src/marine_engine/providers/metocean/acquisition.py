@@ -20,13 +20,38 @@ A chunk is considered already-acquired only when its `product_id`,
 entry's local file still exists on disk -- never on time range alone,
 since a re-run with different variables/bbox/depths must not be silently
 skipped.
+
+Chunk-boundary temporal integrity (MAR-009B)
+-----------------------------------------------
+`generate_monthly_chunks`/`generate_yearly_chunks` split `[start, end)`
+into UTC-calendar-aligned Python-side half-open ranges, but the real
+Copernicus Marine Toolbox `subset()` call treats `end_datetime` as
+INCLUSIVE -- so chunk N's request ending at a calendar boundary and chunk
+N+1's request starting at that same instant both return that one real
+timestamp. Concatenating chunks (`xr.open_mfdataset(..., combine="by_coords")`)
+therefore does not itself deduplicate; the real MAR-009/MAR-009A
+acquisition carried exactly one duplicated hourly row per internal monthly
+boundary (26 boundaries -> 26 duplicate timestamps -> 260,764 rows instead
+of the physically correct 260,400). `deduplicate_time_coordinate` fixes
+this at the CHUNK ASSEMBLY boundary -- the point where multiple raw chunks
+become one canonical dynamic dataset -- so every downstream `normalize_*`
+function in `metocean/evidence.py` always receives an already-unique,
+already-monotonic time coordinate; this is never patched after the fact
+inside a statistics function. It never rewrites or deletes the raw
+downloaded NetCDF chunk files -- it operates purely on the already-opened,
+in-memory `xr.Dataset`.
 """
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+import numpy as np
+import pandas as pd
+import xarray as xr
 
 MANIFEST_ENTRY_FIELDS = (
     "provider",
@@ -294,3 +319,79 @@ def record_acquisition(
     entries.append(entry)
     save_manifest(manifest_path, entries)
     return entry
+
+
+# --- Chunk-boundary temporal integrity (MAR-009B) ----------------------------
+
+
+@dataclass(frozen=True)
+class TemporalDeduplicationResult:
+    """Per-product chunk-boundary temporal QA (Section 5)."""
+
+    raw_time_count: int
+    unique_time_count: int
+    duplicate_boundary_timestamp_count: int
+
+
+class DuplicateTimestampConflictError(Exception):
+    """Two acquired chunks disagree on the data at a shared boundary timestamp.
+
+    Raised instead of silently keeping either copy (Section 3) -- a real
+    disagreement between two downloads of the same nominal instant is a
+    genuine data-integrity problem (a corrupted file, a mid-flight product
+    revision, a race condition) that a human must investigate, never a
+    case to guess through.
+    """
+
+
+def deduplicate_time_coordinate(
+    ds: xr.Dataset,
+) -> tuple[xr.Dataset, TemporalDeduplicationResult]:
+    """Collapse duplicate timestamps introduced by inclusive-both-ends chunk boundaries.
+
+    Detects every timestamp value appearing more than once, requires ALL
+    data variables to agree at every duplicate occurrence (NaN treated as
+    equal to NaN via `np.isclose(..., equal_nan=True)` -- a genuine gap
+    should be consistently absent across both copies, not silently
+    disagree) before ever collapsing it to one canonical row, and raises
+    `DuplicateTimestampConflictError` the moment any duplicate's data
+    disagrees. Keeps the first chronological occurrence of each unique
+    timestamp and re-sorts by time, so the returned dataset's time
+    coordinate is always both unique and strictly increasing regardless of
+    the original chunk concatenation order.
+    """
+
+    time_values = ds["time"].to_numpy()
+    raw_time_count = int(len(time_values))
+    time_index = pd.Index(time_values)
+    unique_time_count = int(time_index.nunique())
+    duplicate_boundary_timestamp_count = raw_time_count - unique_time_count
+
+    if duplicate_boundary_timestamp_count == 0:
+        return ds, TemporalDeduplicationResult(raw_time_count, unique_time_count, 0)
+
+    has_duplicate = time_index.duplicated(keep=False)
+    for duplicate_time in time_index[has_duplicate].unique():
+        occurrence_positions = np.flatnonzero(time_index == duplicate_time)
+        reference_position = occurrence_positions[0]
+        for other_position in occurrence_positions[1:]:
+            for var_name in ds.data_vars:
+                if "time" not in ds[var_name].dims:
+                    continue
+                reference_slice = np.asarray(ds[var_name].isel(time=reference_position).to_numpy())
+                other_slice = np.asarray(ds[var_name].isel(time=other_position).to_numpy())
+                if not np.all(np.isclose(reference_slice, other_slice, equal_nan=True)):
+                    raise DuplicateTimestampConflictError(
+                        f"duplicate acquisition timestamp {duplicate_time} disagrees in "
+                        f"variable '{var_name}' between chunk-acquired slices at time "
+                        f"positions {reference_position} and {other_position} -- refusing "
+                        "to silently discard either copy"
+                    )
+
+    keep_first_mask = ~time_index.duplicated(keep="first")
+    deduped = ds.isel(time=np.flatnonzero(keep_first_mask)).sortby("time")
+    return deduped, TemporalDeduplicationResult(
+        raw_time_count=raw_time_count,
+        unique_time_count=unique_time_count,
+        duplicate_boundary_timestamp_count=duplicate_boundary_timestamp_count,
+    )

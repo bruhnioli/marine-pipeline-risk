@@ -1025,6 +1025,106 @@ def test_normalize_wave_only_processes_nodes_actually_passed_in():
     assert len(result) == len(used_node_ids) * len(times)
 
 
+# --- Temporal integrity: _completeness_pct / validate_temporal_integrity (MAR-009B) --
+
+
+def test_completeness_pct_normal_case():
+    assert evidence._completeness_pct(80, 100) == pytest.approx(80.0)
+
+
+def test_completeness_pct_none_when_no_expected_count():
+    assert evidence._completeness_pct(0, 0) is None
+
+
+def test_completeness_pct_exactly_100_is_allowed():
+    assert evidence._completeness_pct(100, 100) == pytest.approx(100.0)
+
+
+def test_completeness_pct_raises_when_valid_exceeds_expected():
+    """Section 6/17: completeness must never exceed 100% -- a hard failure, not a clamp."""
+
+    with pytest.raises(evidence.TemporalCompletenessError):
+        evidence._completeness_pct(101, 100)
+
+
+def test_validate_temporal_integrity_all_pass_case():
+    df = pd.DataFrame(
+        {
+            "current_node_id": ["A", "A", "B", "B"],
+            "time_utc": [
+                pd.Timestamp("2025-01-01T00:00", tz="UTC"),
+                pd.Timestamp("2025-01-01T01:00", tz="UTC"),
+                pd.Timestamp("2025-01-01T00:00", tz="UTC"),
+                pd.Timestamp("2025-01-01T01:00", tz="UTC"),
+            ],
+        }
+    )
+
+    result = evidence.validate_temporal_integrity(
+        df, time_column="time_utc", node_column="current_node_id"
+    )
+
+    assert result == {
+        "time_coordinate_unique": True,
+        "time_coordinate_monotonic_increasing": True,
+        "duplicate_node_time_row_count": 0,
+    }
+
+
+def test_validate_temporal_integrity_detects_duplicate_node_time_rows():
+    """Section 4/17-6: no duplicate (node_id, time_utc) rows -- this must catch one."""
+
+    df = pd.DataFrame(
+        {
+            "wave_node_id": ["A", "A", "A"],
+            "time_utc": [
+                pd.Timestamp("2025-01-01T00:00", tz="UTC"),
+                pd.Timestamp("2025-01-01T00:00", tz="UTC"),  # exact duplicate row
+                pd.Timestamp("2025-01-01T03:00", tz="UTC"),
+            ],
+        }
+    )
+
+    result = evidence.validate_temporal_integrity(
+        df, time_column="time_utc", node_column="wave_node_id"
+    )
+
+    assert result["time_coordinate_unique"] is False
+    assert result["duplicate_node_time_row_count"] == 1
+
+
+def test_validate_temporal_integrity_detects_non_monotonic_order():
+    df = pd.DataFrame(
+        {
+            "current_lt_node_id": ["A", "A", "A"],
+            "time_utc": [
+                pd.Timestamp("2025-01-01T02:00", tz="UTC"),
+                pd.Timestamp("2025-01-01T00:00", tz="UTC"),  # out of order
+                pd.Timestamp("2025-01-01T01:00", tz="UTC"),
+            ],
+        }
+    )
+
+    result = evidence.validate_temporal_integrity(
+        df, time_column="time_utc", node_column="current_lt_node_id"
+    )
+
+    assert result["time_coordinate_unique"] is True  # no repeated values
+    assert result["time_coordinate_monotonic_increasing"] is False
+
+
+def test_validate_temporal_integrity_empty_input():
+    result = evidence.validate_temporal_integrity(
+        pd.DataFrame(), time_column="time_utc", node_column="current_node_id"
+    )
+
+    assert result == {
+        "time_coordinate_unique": None,
+        "time_coordinate_monotonic_increasing": None,
+        "duplicate_node_time_row_count": None,
+    }
+
+
 # --- compute_current_node_statistics -----------------------------------------------
 
 
@@ -1060,6 +1160,26 @@ def test_compute_current_node_statistics_percentiles_and_completeness():
     assert row["current_speed_p99_m_s"] == pytest.approx(float(expected.quantile(0.99)))
     assert row["current_speed_max_m_s"] == pytest.approx(float(expected.max()))
     assert row["representative_sample_depth_m"] == pytest.approx(5.0)
+
+
+def test_compute_current_node_statistics_raises_when_duplicate_rows_exceed_100_pct():
+    """Section 6/17: a completeness >100% (the real MAR-009/MAR-009A chunk-boundary
+    defect this ticket fixes) must be a hard failure, never silently reported."""
+
+    base_time = pd.Timestamp("2025-01-01", tz="UTC")
+    # hour 1 duplicated -- exactly the shape of an un-deduplicated chunk boundary.
+    times = [base_time + pd.Timedelta(hours=h) for h in [0, 1, 1, 2]]
+    primary_current_df = pd.DataFrame(
+        {
+            "current_node_id": ["NODE_A"] * 4,
+            "time_utc": times,
+            "current_speed_m_s": [0.1, 0.2, 0.2, 0.3],
+            "current_sample_depth_m": [5.0, 5.0, 5.0, 5.0],
+        }
+    )
+
+    with pytest.raises(evidence.TemporalCompletenessError):
+        evidence.compute_current_node_statistics(primary_current_df)
 
 
 # --- compute_wave_node_statistics ---------------------------------------------------
@@ -1099,6 +1219,71 @@ def test_compute_wave_node_statistics_hs_and_tp_correct():
     assert row["hs_max_m"] == pytest.approx(float(expected_hs.max()))
     assert row["tp_median_s"] == pytest.approx(float(expected_tp.median()))
     assert row["tp_p95_s"] == pytest.approx(float(expected_tp.quantile(0.95)))
+
+
+def test_compute_wave_node_statistics_raises_when_duplicate_rows_exceed_100_pct():
+    """Section 8/17: a yearly wave chunk-boundary duplicate must not silently pass."""
+
+    base_time = pd.Timestamp("2025-01-01", tz="UTC")
+    # 3-hour step 3 duplicated -- exactly the shape of an un-deduplicated yearly boundary.
+    steps = [0, 3, 3, 6]
+    times = [base_time + pd.Timedelta(hours=h) for h in steps]
+    wave_df = pd.DataFrame(
+        {
+            "wave_node_id": ["WAVE_A"] * 4,
+            "time_utc": times,
+            "hs_m": [1.0, 1.2, 1.2, 1.4],
+            "tp_s": [8.0, 8.5, 8.5, 9.0],
+        }
+    )
+
+    with pytest.raises(evidence.TemporalCompletenessError):
+        evidence.compute_wave_node_statistics(wave_df)
+
+
+# --- compute_long_term_surface_current_statistics (MAR-009B, Section 7) -------------
+
+
+def test_compute_long_term_surface_current_statistics_completeness_added():
+    hours = [0, 1, 2, 4, 5]  # hour 3 deliberately missing
+    base_time = pd.Timestamp("2025-01-01", tz="UTC")
+    times = [base_time + pd.Timedelta(hours=h) for h in hours]
+    speeds = [0.10, 0.20, 0.30, 0.40, 0.50]
+
+    long_term_df = pd.DataFrame(
+        {
+            "current_lt_node_id": ["LT_A"] * len(hours),
+            "time_utc": times,
+            "surface_current_speed_m_s": speeds,
+        }
+    )
+
+    result = evidence.compute_long_term_surface_current_statistics(long_term_df)
+
+    assert len(result) == 1
+    row = result.iloc[0]
+    # Span is hour0..hour5 = 6 expected hours; only 5 present.
+    assert row["expected_hourly_count"] == 6
+    assert row["valid_hour_count"] == 5
+    assert row["completeness_pct"] == pytest.approx(100.0 * 5.0 / 6.0)
+    assert row["surface_current_speed_mean_m_s"] == pytest.approx(float(pd.Series(speeds).mean()))
+
+
+def test_compute_long_term_surface_current_statistics_raises_when_duplicate_rows_exceed_100_pct():
+    """Section 7/8/17: yearly long-term-current chunk-boundary duplicate must not silently pass."""
+
+    base_time = pd.Timestamp("2025-01-01", tz="UTC")
+    times = [base_time + pd.Timedelta(hours=h) for h in [0, 1, 1, 2]]  # hour 1 duplicated
+    long_term_df = pd.DataFrame(
+        {
+            "current_lt_node_id": ["LT_A"] * 4,
+            "time_utc": times,
+            "surface_current_speed_m_s": [0.1, 0.2, 0.2, 0.3],
+        }
+    )
+
+    with pytest.raises(evidence.TemporalCompletenessError):
+        evidence.compute_long_term_surface_current_statistics(long_term_df)
 
 
 # --- compute_annual_max_hs -----------------------------------------------------------
@@ -1323,6 +1508,22 @@ def test_build_chainage_metocean_evidence_deterministic():
 # --- print_metocean_evidence_report (smoke) -----------------------------------------
 
 
+def _empty_temporal_qa() -> dict:
+    """A no-data temporal QA dict, matching what the CLI builds from `None`/empty inputs."""
+
+    qa = {
+        "raw_time_count": None,
+        "unique_time_count": None,
+        "duplicate_boundary_timestamp_count": None,
+    }
+    qa.update(
+        evidence.validate_temporal_integrity(
+            pd.DataFrame(), time_column="time_utc", node_column="node_id"
+        )
+    )
+    return qa
+
+
 def test_print_metocean_evidence_report_smoke_does_not_crash_on_empty_inputs():
     buffer = io.StringIO()
     empty_distance_diagnostics = evidence.compute_distance_diagnostics(pd.DataFrame())
@@ -1332,12 +1533,16 @@ def test_print_metocean_evidence_report_smoke_does_not_crash_on_empty_inputs():
         primary_current_route_summary=evidence.compute_primary_current_route_summary(
             pd.DataFrame()
         ),
+        primary_current_canonical_row_count=0,
+        primary_temporal_qa=_empty_temporal_qa(),
         below_bed_diagnostics=pd.DataFrame(),
         primary_distance_diagnostics=empty_distance_diagnostics,
         long_term_stats=pd.DataFrame(),
+        long_term_temporal_qa=_empty_temporal_qa(),
         long_term_distance_diagnostics=empty_distance_diagnostics,
         short_window_ratios=pd.DataFrame(),
         wave_stats=pd.DataFrame(),
+        wave_temporal_qa=_empty_temporal_qa(),
         wave_distance_diagnostics=empty_distance_diagnostics,
         primary_current_actual_start=None,
         primary_current_actual_end=None,
@@ -1387,12 +1592,16 @@ def test_print_metocean_evidence_report_support_node_count_is_route_used_count()
         primary_current_route_summary=evidence.compute_primary_current_route_summary(
             pd.DataFrame()
         ),
+        primary_current_canonical_row_count=0,
+        primary_temporal_qa=_empty_temporal_qa(),
         below_bed_diagnostics=pd.DataFrame(),
         primary_distance_diagnostics=empty_distance_diagnostics,
         long_term_stats=pd.DataFrame(),
+        long_term_temporal_qa=_empty_temporal_qa(),
         long_term_distance_diagnostics=empty_distance_diagnostics,
         short_window_ratios=pd.DataFrame(),
         wave_stats=wave_stats,
+        wave_temporal_qa=_empty_temporal_qa(),
         wave_distance_diagnostics=empty_distance_diagnostics,
         primary_current_actual_start=None,
         primary_current_actual_end=None,

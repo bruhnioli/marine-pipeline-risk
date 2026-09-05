@@ -1,4 +1,4 @@
-"""PL854 metocean forcing evidence base assembly (MAR-009/MAR-009A).
+"""PL854 metocean forcing evidence base assembly (MAR-009/MAR-009A/MAR-009B).
 
 Scope and interpretation (mandatory reading before touching this module)
 --------------------------------------------------------------------------
@@ -46,6 +46,20 @@ same underlying model grid -- an assumption this module never makes.
 longitude/latitude against the ACTUAL dynamic dataset's own coordinate
 arrays before every dynamic sampling operation, and refuses to guess (skips
 the node, flagged) if no sufficiently close cell exists there.
+
+Temporal integrity (MAR-009B)
+---------------------------------
+Every `normalize_*` function here receives an already-deduplicated dynamic
+dataset (see `providers.metocean.acquisition.deduplicate_time_coordinate`,
+applied at chunk assembly, upstream of this module) whose time coordinate
+is already unique and monotonically increasing -- the real MAR-009/
+MAR-009A acquisition otherwise carried one duplicated hourly row per
+internal monthly chunk boundary (26 boundaries -> 260,764 rows instead of
+the physically correct 260,400), silently inflating completeness above
+100%. `validate_temporal_integrity` re-confirms this defensively on the
+normalized output itself (never a substitute for the upstream fix), and
+`_completeness_pct` refuses (`TemporalCompletenessError`) to ever report
+completeness above 100% for any of the three products.
 
 No bed shear stress, Shields parameter, sediment mobility, wave orbital
 velocity, erosion/deposition, scour, free-span, or risk scoring is
@@ -590,6 +604,74 @@ def normalize_wave(
     return pd.DataFrame(records, columns=list(WAVE_COLUMNS)), unreconciled_node_ids
 
 
+# --- Temporal integrity (MAR-009B, Sections 4-8) -----------------------------
+
+
+class TemporalCompletenessError(Exception):
+    """More valid samples exist than the expected regular-cadence count allows.
+
+    A properly deduplicated canonical time series (see
+    `providers.metocean.acquisition.deduplicate_time_coordinate`) can never
+    contain more valid samples than its own expected-count formula
+    permits; seeing more means an unresolved temporal defect (e.g. an
+    undetected duplicate timestamp) survived upstream -- surfaced here as
+    a hard failure, never silently clamped to 100%.
+    """
+
+
+def _completeness_pct(valid_count: int, expected_count: int) -> float | None:
+    """`valid_count`/`expected_count`, or `None` if there is no expected count.
+
+    Shared by all three products' statistics functions so "completeness
+    must never exceed 100%" (Section 6) is enforced identically everywhere
+    rather than reimplemented per product.
+    """
+
+    if not expected_count:
+        return None
+    if valid_count > expected_count:
+        raise TemporalCompletenessError(
+            f"{valid_count} valid samples exceeds the expected regular-cadence count of "
+            f"{expected_count} -- completeness must never exceed 100%"
+        )
+    return 100.0 * valid_count / expected_count
+
+
+def validate_temporal_integrity(
+    df: pd.DataFrame, *, time_column: str, node_column: str
+) -> dict[str, Any]:
+    """Post-canonicalization temporal QA (Section 4/5): unique, monotonic, no duplicate rows.
+
+    Checked per node (each node's own time series must carry unique,
+    strictly increasing timestamps in stored row order) and across the
+    whole table (no repeated `(node, time)` pair). A defensive
+    confirmation that chunk-boundary deduplication actually produced a
+    clean canonical time coordinate -- never a substitute for it.
+    """
+
+    empty: dict[str, Any] = {
+        "time_coordinate_unique": None,
+        "time_coordinate_monotonic_increasing": None,
+        "duplicate_node_time_row_count": None,
+    }
+    if df.empty:
+        return empty
+
+    duplicate_node_time_row_count = int(df.duplicated(subset=[node_column, time_column]).sum())
+    unique_per_node = []
+    monotonic_per_node = []
+    for _, group in df.groupby(node_column):
+        times = group[time_column]
+        unique_per_node.append(bool(times.is_unique))
+        monotonic_per_node.append(bool(times.is_monotonic_increasing))
+
+    return {
+        "time_coordinate_unique": all(unique_per_node),
+        "time_coordinate_monotonic_increasing": all(monotonic_per_node),
+        "duplicate_node_time_row_count": duplicate_node_time_row_count,
+    }
+
+
 # --- Descriptive statistics (Sections 24, 25) --------------------------------
 
 
@@ -633,9 +715,7 @@ def compute_current_node_statistics(primary_current_df: pd.DataFrame) -> pd.Data
                 "end_time_utc": end,
                 "expected_hourly_count": expected_hours,
                 "valid_hour_count": int(len(valid_speed)),
-                "completeness_pct": (100.0 * len(valid_speed) / expected_hours)
-                if expected_hours
-                else None,
+                "completeness_pct": _completeness_pct(len(valid_speed), expected_hours),
                 "current_speed_mean_m_s": float(valid_speed.mean()) if len(valid_speed) else None,
                 "current_speed_median_m_s": float(valid_speed.median())
                 if len(valid_speed)
@@ -659,11 +739,21 @@ def compute_current_node_statistics(primary_current_df: pd.DataFrame) -> pd.Data
 
 
 def compute_long_term_surface_current_statistics(long_term_df: pd.DataFrame) -> pd.DataFrame:
+    """Per current_lt_node_id: temporal support + surface speed percentiles.
+
+    `completeness_pct` (MAR-009B, Section 7) mirrors the primary-current
+    formula exactly -- this product is hourly too -- computed from the
+    node's own actual (already-deduplicated) start/end interval, never a
+    hard-coded expectation.
+    """
+
     columns = (
         "current_lt_node_id",
         "start_time_utc",
         "end_time_utc",
+        "expected_hourly_count",
         "valid_hour_count",
+        "completeness_pct",
         "surface_current_speed_mean_m_s",
         "surface_current_speed_p95_m_s",
         "surface_current_speed_p99_m_s",
@@ -675,12 +765,19 @@ def compute_long_term_surface_current_statistics(long_term_df: pd.DataFrame) -> 
     records = []
     for node_id, group in long_term_df.groupby("current_lt_node_id"):
         valid_speed = group["surface_current_speed_m_s"].dropna()
+        start = group["time_utc"].min()
+        end = group["time_utc"].max()
+        expected_hours = (
+            int(round((end - start).total_seconds() / 3600.0)) + 1 if pd.notna(start) else 0
+        )
         records.append(
             {
                 "current_lt_node_id": node_id,
-                "start_time_utc": group["time_utc"].min(),
-                "end_time_utc": group["time_utc"].max(),
+                "start_time_utc": start,
+                "end_time_utc": end,
+                "expected_hourly_count": expected_hours,
                 "valid_hour_count": int(len(valid_speed)),
+                "completeness_pct": _completeness_pct(len(valid_speed), expected_hours),
                 "surface_current_speed_mean_m_s": float(valid_speed.mean())
                 if len(valid_speed)
                 else None,
@@ -734,9 +831,7 @@ def compute_wave_node_statistics(wave_df: pd.DataFrame) -> pd.DataFrame:
                 "end_time_utc": end,
                 "expected_3hour_count": expected_steps,
                 "valid_3hour_count": int(len(valid_hs)),
-                "completeness_pct": (100.0 * len(valid_hs) / expected_steps)
-                if expected_steps
-                else None,
+                "completeness_pct": _completeness_pct(len(valid_hs), expected_steps),
                 "hs_mean_m": float(valid_hs.mean()) if len(valid_hs) else None,
                 "hs_median_m": float(valid_hs.median()) if len(valid_hs) else None,
                 "hs_p90_m": float(valid_hs.quantile(0.90)) if len(valid_hs) else None,
@@ -1076,16 +1171,40 @@ def _fmt(value: Any, spec: str = ".3f") -> str:
         return str(value)
 
 
+def _temporal_qa_all_pass(*qa_dicts: dict[str, Any]) -> bool | None:
+    """Whether every product's temporal QA dict passed unique/monotonic/no-dup-rows.
+
+    Returns `None` (nothing to assess) only when every dict had no data at
+    all; otherwise `False` the moment any assessed product fails.
+    """
+
+    statuses = []
+    for qa in qa_dicts:
+        unique_ok = qa.get("time_coordinate_unique")
+        monotonic_ok = qa.get("time_coordinate_monotonic_increasing")
+        duplicate_rows = qa.get("duplicate_node_time_row_count")
+        if unique_ok is None and monotonic_ok is None and duplicate_rows is None:
+            continue
+        statuses.append(bool(unique_ok) and bool(monotonic_ok) and duplicate_rows == 0)
+    if not statuses:
+        return None
+    return all(statuses)
+
+
 def print_metocean_evidence_report(
     *,
     primary_current_stats: pd.DataFrame,
     primary_current_route_summary: dict[str, Any],
+    primary_current_canonical_row_count: int,
+    primary_temporal_qa: dict[str, Any],
     below_bed_diagnostics: pd.DataFrame,
     primary_distance_diagnostics: dict[str, float | None],
     long_term_stats: pd.DataFrame,
+    long_term_temporal_qa: dict[str, Any],
     long_term_distance_diagnostics: dict[str, float | None],
     short_window_ratios: pd.DataFrame,
     wave_stats: pd.DataFrame,
+    wave_temporal_qa: dict[str, Any],
     wave_distance_diagnostics: dict[str, float | None],
     primary_current_actual_start: datetime | None,
     primary_current_actual_end: datetime | None,
@@ -1097,13 +1216,27 @@ def print_metocean_evidence_report(
     file: Any = None,
 ) -> None:
     file = file or sys.stdout
-    lines = ["=== PL854 Metocean Forcing Evidence Base (MAR-009/MAR-009A) ===", ""]
+    lines = ["=== PL854 Metocean Forcing Evidence Base (MAR-009/MAR-009A/MAR-009B) ===", ""]
 
     # --- Primary current integrity (Section 19) -----------------------------
     lines.append("## Primary current integrity")
     lines.append(f"  Route-used support node count: {len(primary_current_stats)}")
     lines.append(
         f"  Actual interval: {primary_current_actual_start} .. {primary_current_actual_end}"
+    )
+    lines.append(f"  Canonical total row count: {primary_current_canonical_row_count}")
+    lines.append(
+        "  Raw timestamps: "
+        f"{_fmt(primary_temporal_qa.get('raw_time_count'), 'd')} | Unique timestamps: "
+        f"{_fmt(primary_temporal_qa.get('unique_time_count'), 'd')} | Duplicates removed: "
+        f"{_fmt(primary_temporal_qa.get('duplicate_boundary_timestamp_count'), 'd')}"
+    )
+    lines.append(
+        "  time_coordinate_unique="
+        f"{primary_temporal_qa.get('time_coordinate_unique')} "
+        "time_coordinate_monotonic_increasing="
+        f"{primary_temporal_qa.get('time_coordinate_monotonic_increasing')} "
+        f"duplicate_node_time_row_count={primary_temporal_qa.get('duplicate_node_time_row_count')}"
     )
     summary = primary_current_route_summary
     lines.append(
@@ -1145,7 +1278,8 @@ def print_metocean_evidence_report(
         lines.append(
             "  Completeness %: min="
             f"{_fmt(primary_current_stats['completeness_pct'].min(), '.1f')} "
-            f"median={_fmt(primary_current_stats['completeness_pct'].median(), '.1f')}"
+            f"median={_fmt(primary_current_stats['completeness_pct'].median(), '.1f')} "
+            f"max={_fmt(primary_current_stats['completeness_pct'].max(), '.1f')}"
         )
     lines.append(
         "  Station-to-node distance (m): min="
@@ -1169,12 +1303,31 @@ def print_metocean_evidence_report(
     lines.append("## Long-term surface current")
     lines.append(f"  Route-used support nodes: {len(long_term_stats)}")
     lines.append(f"  Actual interval: {long_term_actual_start} .. {long_term_actual_end}")
+    lines.append(
+        "  Raw timestamps: "
+        f"{_fmt(long_term_temporal_qa.get('raw_time_count'), 'd')} | Unique timestamps: "
+        f"{_fmt(long_term_temporal_qa.get('unique_time_count'), 'd')} | Duplicates removed: "
+        f"{_fmt(long_term_temporal_qa.get('duplicate_boundary_timestamp_count'), 'd')}"
+    )
+    lines.append(
+        "  time_coordinate_unique="
+        f"{long_term_temporal_qa.get('time_coordinate_unique')} "
+        "time_coordinate_monotonic_increasing="
+        f"{long_term_temporal_qa.get('time_coordinate_monotonic_increasing')} "
+        f"duplicate_node_time_row_count={long_term_temporal_qa.get('duplicate_node_time_row_count')}"
+    )
     if not long_term_stats.empty:
         lines.append(
             "  Surface speed (m/s): "
             f"p95={long_term_stats['surface_current_speed_p95_m_s'].max():.3f} "
             f"p99={long_term_stats['surface_current_speed_p99_m_s'].max():.3f} "
             f"max={long_term_stats['surface_current_speed_max_m_s'].max():.3f}"
+        )
+        lines.append(
+            "  Completeness %: min="
+            f"{_fmt(long_term_stats['completeness_pct'].min(), '.1f')} "
+            f"median={_fmt(long_term_stats['completeness_pct'].median(), '.1f')} "
+            f"max={_fmt(long_term_stats['completeness_pct'].max(), '.1f')}"
         )
     lines.append(
         "  Station-to-node distance (m): min="
@@ -1195,6 +1348,19 @@ def print_metocean_evidence_report(
     lines.append("## Waves")
     lines.append(f"  Route-used support nodes: {len(wave_stats)}")
     lines.append(f"  Actual interval: {wave_actual_start} .. {wave_actual_end}")
+    lines.append(
+        "  Raw timestamps: "
+        f"{_fmt(wave_temporal_qa.get('raw_time_count'), 'd')} | Unique timestamps: "
+        f"{_fmt(wave_temporal_qa.get('unique_time_count'), 'd')} | Duplicates removed: "
+        f"{_fmt(wave_temporal_qa.get('duplicate_boundary_timestamp_count'), 'd')}"
+    )
+    lines.append(
+        "  time_coordinate_unique="
+        f"{wave_temporal_qa.get('time_coordinate_unique')} "
+        "time_coordinate_monotonic_increasing="
+        f"{wave_temporal_qa.get('time_coordinate_monotonic_increasing')} "
+        f"duplicate_node_time_row_count={wave_temporal_qa.get('duplicate_node_time_row_count')}"
+    )
     if not wave_stats.empty:
         lines.append(
             "  Hs (m): mean="
@@ -1208,7 +1374,8 @@ def print_metocean_evidence_report(
         lines.append(
             "  Completeness %: min="
             f"{_fmt(wave_stats['completeness_pct'].min(), '.1f')} "
-            f"median={_fmt(wave_stats['completeness_pct'].median(), '.1f')}"
+            f"median={_fmt(wave_stats['completeness_pct'].median(), '.1f')} "
+            f"max={_fmt(wave_stats['completeness_pct'].max(), '.1f')}"
         )
     lines.append(
         "  Station-to-node distance (m): min="
@@ -1226,6 +1393,18 @@ def print_metocean_evidence_report(
             changed = "CHANGED" if old_value != new_value else "unchanged"
             lines.append(f"  {label}: old={_fmt(old_value)} -> new={_fmt(new_value)} ({changed})")
         lines.append("")
+
+    # --- Temporal integrity banner (MAR-009B, Section 12) --------------------
+    all_temporal_ok = _temporal_qa_all_pass(
+        primary_temporal_qa, long_term_temporal_qa, wave_temporal_qa
+    )
+    if all_temporal_ok:
+        lines.append("ALL CANONICAL METOCEAN TIME COORDINATES ARE UNIQUE AND MONOTONIC")
+    elif all_temporal_ok is False:
+        lines.append(
+            "FAILURE: one or more canonical metocean time coordinates are not unique/monotonic"
+        )
+    lines.append("")
 
     lines.append(
         "No bed shear stress, Shields parameter, sediment mobility, or risk scoring computed."

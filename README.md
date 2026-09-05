@@ -464,3 +464,57 @@ otherwise, never an interactive credential prompt.
   corrected height-above-bed, model bathymetry, current statistics, and
   support-node distances is required before MAR-010 (near-bed hydrodynamic
   formulation) begins -- no further ticket has started.
+- `MAR-009B`: the real re-run confirmed a second, independent integrity
+  finding: the Copernicus Marine Toolbox's `subset()` treats `end_datetime`
+  as INCLUSIVE, so two adjacent monthly/yearly acquisition chunks each
+  return their shared boundary instant, and
+  `xr.open_mfdataset(..., combine="by_coords")` does not itself deduplicate
+  -- the real primary-current record carried **18,626 raw hourly
+  timestamps per node against the physically correct 18,600** (26
+  duplicated internal monthly-chunk boundaries), pushing completeness to a
+  physically-impossible ~100.1%; the same class of duplication was
+  confirmed in the yearly long-term-current (33 duplicate boundaries) and
+  wave (46 duplicate boundaries) acquisitions. Fixed at the CHUNK ASSEMBLY
+  boundary, not inside any statistics function:
+  `deduplicate_time_coordinate` (`providers/metocean/acquisition.py`)
+  detects every duplicated timestamp, requires every data variable to
+  agree at every duplicate occurrence (NaN treated as equal to NaN) before
+  ever collapsing it to one canonical row, and raises
+  `DuplicateTimestampConflictError` -- never silently picking a side -- the
+  moment any duplicate's data disagrees; it never rewrites or deletes the
+  raw NetCDF chunk files. Every `normalize_*` function now always receives
+  an already-unique, already-monotonic time coordinate.
+  `validate_temporal_integrity` (`metocean/evidence.py`) defensively
+  re-confirms uniqueness/monotonicity/no-duplicate-`(node, time)`-rows on
+  the normalized output itself, and a new `_completeness_pct` helper
+  refuses (`TemporalCompletenessError`) to ever report completeness above
+  100% for any of the three products -- a hard failure, never a silent
+  clamp. `compute_long_term_surface_current_statistics` gained a
+  `completeness_pct` field for the first time (Section 7 of the ticket).
+
+  Independently re-running `build-metocean-evidence` against the
+  already-downloaded raw chunks (zero re-download confirmed: byte-identical
+  raw file mtimes and an unchanged 111-entry manifest) and reopening all 9
+  canonical outputs directly confirms **primary current: exactly 260,400
+  canonical rows (18,600/node x 14 nodes), 100.0% completeness at every
+  node, zero duplicate `(node, time)` rows, ALL CANONICAL METOCEAN TIME
+  COORDINATES ARE UNIQUE AND MONOTONIC** -- matching the ticket's
+  independently-derived expected count exactly. Long-term surface current
+  (1,174,464 rows, 4 nodes) and wave (1,895,264 rows, 14 nodes) show the
+  same zero-duplicate, 100.0%-completeness result. Removing exact
+  duplicate rows left the aggregate current-speed/Hs/Tp statistics
+  materially unchanged (duplicates carried the same values as their
+  originals, so only the row/completeness accounting was wrong, not the
+  distribution) -- the old (MAR-009A-era) on-disk data itself still
+  exceeded 100% completeness, so old-vs-new comparison values for the
+  absolute statistics are reported as `n/a` (unavailable) rather than
+  computed from data the new strict check correctly refuses to trust; the
+  two node-count comparisons (wave 14, long-term current 4) are unchanged,
+  as expected. 19 new offline tests were added across
+  `test_metocean_acquisition.py` and `test_metocean_evidence.py`, including
+  realistic monthly-current, yearly-long-term-current, and yearly-wave
+  boundary-overlap cases and an explicit NaN-consistency case; the full
+  offline suite (517 tests) and repo-wide `ruff format`/`ruff check` pass
+  clean. No bed shear stress, Shields parameter, sediment mobility,
+  erosion/deposition, scour, free-span, fatigue, or risk scoring is
+  computed anywhere in this ticket -- no further ticket has started.
