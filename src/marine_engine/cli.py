@@ -50,7 +50,7 @@ from marine_engine.providers.nsta import (
     print_ingestion_report,
 )
 from marine_engine.providers.sediment import bgs as sediment_bgs
-from marine_engine.sediment import evidence
+from marine_engine.sediment import evidence, noncohesive_mobility, noncohesive_mobility_map
 
 
 def _cmd_version(_args: argparse.Namespace) -> int:
@@ -2706,6 +2706,330 @@ def _cmd_build_combined_bed_shear(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_noncohesive_mobility(args: argparse.Namespace) -> int:
+    """MAR-013: noncohesive sediment mobility capacity + map + profile.
+
+    Requires the MAR-009B canonical primary current, MAR-011A wave orbital,
+    and MAR-008 sediment evidence outputs to already exist on disk; performs
+    NO network request -- everything it reads was already computed. Reuses
+    MAR-012's verified hydro-node spatial reconciliation logic directly.
+    """
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    pipeline_gpkg_path, _aoi_gpkg_path, _chainage_gpkg_path, interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+    metocean_interim_dir = interim_dir / "metocean"
+    metocean_processed_dir = study_dir / "metocean"
+    sediment_interim_dir = interim_dir / "sediment"
+    sediment_processed_dir = study_dir / "sediment"
+    maps_dir = study_dir / "maps"
+
+    current_hourly_path = metocean_interim_dir / "current_primary_hourly.parquet"
+    current_nodes_path = metocean_interim_dir / "current_primary_support_nodes.parquet"
+    wave_hourly_path = metocean_interim_dir / "wave_orbital_velocity_3hourly.parquet"
+    wave_nodes_path = metocean_interim_dir / "wave_support_nodes.parquet"
+    chainage_metocean_path = metocean_processed_dir / "chainage_metocean_evidence.parquet"
+    chainage_sediment_path = sediment_processed_dir / "chainage_sediment_evidence.parquet"
+    psa_observations_path = sediment_interim_dir / "bgs_psa_observations.parquet"
+    required_paths = (
+        pipeline_gpkg_path,
+        current_hourly_path,
+        current_nodes_path,
+        wave_hourly_path,
+        wave_nodes_path,
+        chainage_metocean_path,
+        chainage_sediment_path,
+        psa_observations_path,
+    )
+    missing = [str(p) for p in required_paths if not p.exists()]
+    if missing:
+        print(
+            "error: missing required canonical output(s) -- run build-metocean-evidence, "
+            "build-wave-orbital-forcing, and build-sediment-evidence first: "
+            f"{missing}",
+            file=sys.stderr,
+        )
+        return 1
+
+    working_crs = config.crs.horizontal
+    try:
+        route, _attributes, source_crs = load_pipeline_route(pipeline_gpkg_path, pipeline_id)
+    except InvalidPipelineRouteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if source_crs != working_crs:
+        print(
+            f"error: pipeline CRS {source_crs} does not match configured working CRS {working_crs}",
+            file=sys.stderr,
+        )
+        return 1
+
+    current_hourly_df = pd.read_parquet(current_hourly_path)
+    current_nodes_df = pd.read_parquet(current_nodes_path)
+    wave_hourly_df = pd.read_parquet(wave_hourly_path)
+    wave_nodes_df = pd.read_parquet(wave_nodes_path)
+    chainage_metocean_df = pd.read_parquet(chainage_metocean_path)
+    chainage_sediment_df = pd.read_parquet(chainage_sediment_path)
+    psa_observations_df = pd.read_parquet(psa_observations_path)
+
+    # --- MAR-012's verified spatial reconciliation, reused directly ---------
+    try:
+        hydro_pairs_df = combined_bed_shear.build_hydro_pairs(
+            current_nodes_df, wave_nodes_df, working_crs=working_crs
+        )
+    except combined_bed_shear.UnreconciledHydroNodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    # --- MAR-013 core: grain-related skin friction + Soulsby-Whitehouse -----
+    mobility_df = noncohesive_mobility.build_noncohesive_mobility_3hourly(
+        current_hourly_df, wave_hourly_df, hydro_pairs_df
+    )
+
+    try:
+        stats_df = noncohesive_mobility.compute_noncohesive_mobility_stats(mobility_df)
+    except noncohesive_mobility.NoncohesiveMobilityCompletenessError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    capacity_df = noncohesive_mobility.compute_mobility_capacity_summary(stats_df)
+    observed_d50_context_df = noncohesive_mobility.build_observed_d50_context(psa_observations_df)
+
+    # --- per-hydro-pair capacity attributes for segment/map assembly --------
+    stats_by_pair_d50 = stats_df.set_index(["hydro_pair_id", "tested_d50_mm"])
+    capacity_by_pair_id: dict[str, noncohesive_mobility_map.CapacityAttributes] = {}
+    for _, row in capacity_df.iterrows():
+        pair_id = row["hydro_pair_id"]
+        reference_ratios: dict[float, float | None] = {}
+        for mm in noncohesive_mobility.REFERENCE_D50_SCENARIOS_MM:
+            key = (pair_id, mm)
+            reference_ratios[mm] = (
+                _none_if_nan(stats_by_pair_d50.loc[key, "mobility_ratio_p95"])
+                if key in stats_by_pair_d50.index
+                else None
+            )
+        capacity_by_pair_id[pair_id] = noncohesive_mobility_map.CapacityAttributes(
+            largest_tested_d50_with_p90_mobility_ratio_ge_1_mm=_none_if_nan(
+                row["largest_tested_d50_with_p90_mobility_ratio_ge_1_mm"]
+            ),
+            largest_tested_d50_with_p95_mobility_ratio_ge_1_mm=_none_if_nan(
+                row["largest_tested_d50_with_p95_mobility_ratio_ge_1_mm"]
+            ),
+            largest_tested_d50_with_p99_mobility_ratio_ge_1_mm=_none_if_nan(
+                row["largest_tested_d50_with_p99_mobility_ratio_ge_1_mm"]
+            ),
+            largest_tested_d50_with_any_exceedance_mm=_none_if_nan(
+                row["largest_tested_d50_with_any_exceedance_mm"]
+            ),
+            p95_mobility_sequence_monotonic_nonincreasing=(
+                bool(row["p95_mobility_sequence_monotonic_nonincreasing"])
+                if pd.notna(row["p95_mobility_sequence_monotonic_nonincreasing"])
+                else None
+            ),
+            monotonicity_violation_count=(
+                int(row["monotonicity_violation_count"])
+                if pd.notna(row["monotonicity_violation_count"])
+                else None
+            ),
+            reference_p95_ratios_by_mm=reference_ratios,
+        )
+
+    # --- contiguous map segments (reusing MAR-012's hydro pairs) -------------
+    chainage_hydro_df = (
+        chainage_metocean_df[["station_index", "chainage_m", "current_node_id", "wave_node_id"]]
+        .merge(
+            hydro_pairs_df[["current_node_id", "wave_node_id", "hydro_pair_id"]],
+            on=["current_node_id", "wave_node_id"],
+            how="left",
+        )
+        .merge(
+            chainage_sediment_df[
+                ["station_index", "mapped_250k_folk_class", "mapped_250k_nominal_scale"]
+            ],
+            on="station_index",
+            how="left",
+        )
+    )
+    segments_gdf = noncohesive_mobility_map.build_noncohesive_mobility_capacity_segments(
+        pipeline_id=pipeline_id,
+        route=route,
+        chainage_hydro_df=chainage_hydro_df,
+        capacity_by_pair_id=capacity_by_pair_id,
+        observed_d50_context_df=observed_d50_context_df,
+        working_crs=working_crs,
+    )
+
+    # --- write parquet/gpkg outputs ------------------------------------------
+    mobility_hourly_path = metocean_evidence.write_parquet(
+        mobility_df, sediment_interim_dir / "noncohesive_mobility_3hourly.parquet"
+    )
+    stats_path = metocean_evidence.write_parquet(
+        stats_df, sediment_processed_dir / "noncohesive_mobility_stats.parquet"
+    )
+    observed_context_path = metocean_evidence.write_parquet(
+        observed_d50_context_df, sediment_processed_dir / "observed_d50_context.parquet"
+    )
+    segments_path = noncohesive_mobility_map.write_noncohesive_mobility_capacity_segments_gpkg(
+        segments_gdf, sediment_processed_dir / "noncohesive_mobility_capacity_segments.gpkg"
+    )
+
+    background_raster_path = study_dir / "bathymetry" / "emodnet_baseline_lat_100m.tif"
+    png_path = noncohesive_mobility_map.render_noncohesive_mobility_capacity_map(
+        segments_gdf=segments_gdf,
+        route=route,
+        working_crs=working_crs,
+        output_path=maps_dir / "pl854_noncohesive_mobility_capacity.png",
+        psa_observations_df=psa_observations_df,
+        background_raster_path=(
+            background_raster_path if background_raster_path.exists() else None
+        ),
+    )
+    png_dimensions = noncohesive_mobility_map.read_png_dimensions(png_path)
+
+    profile_path = noncohesive_mobility_map.render_mobility_capacity_profile(
+        segments_gdf=segments_gdf,
+        psa_observations_df=psa_observations_df,
+        working_crs=working_crs,
+        output_path=maps_dir / "pl854_mobility_capacity_profile.png",
+    )
+    profile_dimensions = noncohesive_mobility_map.read_png_dimensions(profile_path)
+
+    # --- metadata --------------------------------------------------------------
+    metadata_path = sediment_processed_dir / "noncohesive_mobility_metadata.json"
+    metadata = {
+        "scientific_role": noncohesive_mobility.SCIENTIFIC_ROLE,
+        "tested_d50_scenarios_mm": list(noncohesive_mobility.TESTED_D50_SCENARIOS_MM),
+        "grain_size_scenario_semantics": noncohesive_mobility.GRAIN_SIZE_SCENARIO_SEMANTICS,
+        "gravity_m_s2": noncohesive_mobility.GRAVITY_M_S2,
+        "rho_water_kg_m3": noncohesive_mobility.RHO_WATER_KG_M3,
+        "rho_sediment_kg_m3": noncohesive_mobility.RHO_SEDIMENT_KG_M3,
+        "rho_sediment_note": (
+            "A quartz/mineral-density reference assumption for this noncohesive test-"
+            "scenario analysis -- never a measured PL854 sediment mineral density."
+        ),
+        "kinematic_viscosity_m2_s": noncohesive_mobility.KINEMATIC_VISCOSITY_M2_S,
+        "von_karman_kappa": noncohesive_mobility.VON_KARMAN_KAPPA,
+        "grain_skin_roughness_relation": "z0_skin = d50 / 12",
+        "current_skin_stress_equation": (
+            "u_star_c_skin = kappa*U_ref / ln((z_r+z0_skin)/z0_skin); "
+            "tau_current_skin_pa = rho_water * u_star_c_skin^2"
+        ),
+        "wave_skin_friction_equations": (
+            "A_wave = Uw*Trep/(2*pi); Rw = Uw*A_wave/nu; "
+            "f_ws = 2.0*Rw^(-0.5) (Rw<=5e5) or 0.0521*Rw^(-0.187) (Rw>5e5); "
+            "f_wr = 1.39*(A_wave/z0_skin)^(-0.52); f_w_skin = max(f_ws, f_wr); "
+            "tau_wave_skin_pa = 0.5*rho_water*f_w_skin*Uw^2"
+        ),
+        "soulsby_combined_stress_equations": (
+            "tau_mean_grain_skin = tau_current_skin*[1+1.2*(tau_wave_skin/"
+            "(tau_current_skin+tau_wave_skin))^3.2]; "
+            "tau_max_grain_skin = sqrt((tau_mean_grain_skin+tau_wave_skin*cos(phi))^2 + "
+            "(tau_wave_skin*sin(phi))^2)"
+        ),
+        "dimensionless_grain_size_equation": (
+            "D* = d50 * [g*(rho_sediment/rho_water - 1)/nu^2]^(1/3)"
+        ),
+        "soulsby_whitehouse_theta_cr_equation": (
+            "theta_cr = 0.30/(1+1.2*D*) + 0.055*[1-exp(-0.020*D*)]"
+        ),
+        "tau_cr_equation": "tau_cr = theta_cr * (rho_sediment - rho_water) * g * d50",
+        "mobility_ratio_definition": "tau_max_grain_skin / tau_critical",
+        "incipient_motion_condition": "mobility_ratio >= 1",
+        "continuous_pipeline_d50_field_created": False,
+        "bgs_folk_to_numeric_d50_mapping_applied": False,
+        "psa_d50_interpolation_applied": False,
+        "bgs_predictive_sediment_used_in_physics": False,
+        "cohesive_or_mixed_bed_threshold_physics_applied": False,
+        "sediment_transport_rate_computed": False,
+        "erosion_deposition_computed": False,
+        "scour_computed": False,
+        "pipeline_risk_computed": False,
+        "combined_record_overlap_only": True,
+        "map_colour_variable": "largest_tested_d50_with_p95_mobility_ratio_ge_1_mm",
+        "map_colour_semantics": (
+            "Among the tested noncohesive grain-size scenarios, this is the largest tested "
+            "D50 whose p95 mobility ratio reaches or exceeds the incipient-motion threshold "
+            "-- it does not mean the actual local D50 equals this value, that the entire "
+            "seabed is mobile, that this sediment exists there, or that erosion/scour/"
+            "pipeline exposure will occur."
+        ),
+        "bgs_250k_folk_class_note": (
+            "BGS 250K Folk class provides regional substrate context only and is not "
+            "converted into numeric D50."
+        ),
+        "limitations": [
+            "This is a forcing-capacity product for nine fixed test grain sizes, not a "
+            "continuous site-specific sediment-mobility field.",
+            "The largest passing tested scenario is never extrapolated beyond the tested "
+            "range; a passing largest-tested scenario is flagged as exceeding the tested "
+            "range rather than reported as a true capacity ceiling.",
+            "Mobility ratio is not assumed to decrease monotonically with grain size; the "
+            "ordering is verified per hydro pair and any violation is recorded.",
+            "No Shields threshold, transport rate, erosion, deposition, scour, or pipeline "
+            "risk is computed here.",
+            "Combined statistics are limited to the contemporaneous primary-current/wave "
+            "overlap, not the full 1980-2026 wave record.",
+        ],
+        "references": [
+            {
+                "citation": "Soulsby, R.L. (1997). Dynamics of Marine Sands.",
+                "doi": "10.1680/doms.25844",
+            },
+            {
+                "citation": (
+                    "Soulsby, R.L. & Whitehouse, R.J.S.W. (1997). Threshold of sediment "
+                    "motion in coastal environments."
+                ),
+            },
+            {
+                "citation": (
+                    "Soulsby, R.L. (2006). Simplified calculation of wave orbital "
+                    "velocities. HR Wallingford TR155."
+                ),
+            },
+            {"citation": "BGS Seabed Sediments 250K dataset documentation."},
+        ],
+        "outputs": {
+            "noncohesive_mobility_3hourly": str(mobility_hourly_path),
+            "noncohesive_mobility_stats": str(stats_path),
+            "observed_d50_context": str(observed_context_path),
+            "noncohesive_mobility_capacity_segments": str(segments_path),
+            "noncohesive_mobility_capacity_map_png": str(png_path),
+            "mobility_capacity_profile_png": str(profile_path),
+        },
+    }
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+
+    print(f"Noncohesive mobility (3-hourly): {len(mobility_df)} row(s) -> {mobility_hourly_path}")
+    print(f"Noncohesive mobility stats: {len(stats_df)} row(s) -> {stats_path}")
+    print(f"Observed D50 context: {len(observed_d50_context_df)} row(s) -> {observed_context_path}")
+    print(f"Mobility capacity segments: {len(segments_gdf)} section(s) -> {segments_path}")
+    print(f"Mobility capacity map: {png_path}")
+    print(f"Mobility capacity profile: {profile_path}")
+    print(f"Metadata: {metadata_path}")
+    print()
+    noncohesive_mobility_map.print_noncohesive_mobility_report(
+        stats_df=stats_df,
+        capacity_df=capacity_df,
+        observed_d50_context_df=observed_d50_context_df,
+        segments_gdf=segments_gdf,
+        segments_path=segments_path,
+        png_path=png_path,
+        png_dimensions=png_dimensions,
+        profile_path=profile_path,
+        profile_dimensions=profile_dimensions,
+    )
+    return 0
+
+
 def _dataset_start_or(time_range_ms: tuple | None, fallback_now: datetime) -> datetime:
     """The live dataset's own start timestamp, or `fallback_now` if it could not be discovered."""
 
@@ -2870,6 +3194,20 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_combined_bed_shear_parser.set_defaults(func=_cmd_build_combined_bed_shear)
+
+    build_noncohesive_mobility_parser = subparsers.add_parser(
+        "build-noncohesive-mobility",
+        help=(
+            "Build the noncohesive sediment mobility capacity (MAR-013, Soulsby-Whitehouse) "
+            "and render the capacity map + chainage profile -- no network, requires "
+            "build-metocean-evidence, build-wave-orbital-forcing, and build-sediment-evidence "
+            "to have already run."
+        ),
+    )
+    build_noncohesive_mobility_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_noncohesive_mobility_parser.set_defaults(func=_cmd_build_noncohesive_mobility)
 
     return parser
 

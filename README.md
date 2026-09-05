@@ -750,3 +750,72 @@ otherwise, never an interactive credential prompt.
   stress only -- no Shields parameter, critical shear stress, sediment
   mobility, erosion/deposition, scour, free-span, or risk scoring is
   computed anywhere in this ticket -- no further ticket has started.
+- `MAR-013`: the first sediment-RESPONSE product (`sediment/
+  {noncohesive_mobility,noncohesive_mobility_map}.py`) -- but since PL854
+  has no defensible continuous D50 field, this never claims "the actual
+  seabed sediment is mobile here" along the route. Instead it calculates
+  `NONCOHESIVE_SEDIMENT_MOBILITY_CAPACITY`: for nine FIXED hypothetical
+  noncohesive grain-size TEST scenarios (0.063-16 mm,
+  `TESTED_NONCOHESIVE_GRAIN_SIZE_SCENARIOS_NOT_SITE_SPECIFIC_D50`), it
+  computes grain-consistent skin friction and the Soulsby-Whitehouse
+  critical Shields stress, then reports which TESTED grain sizes the real
+  hydrodynamic forcing is capable of mobilising -- a forcing-CAPACITY
+  product, never a continuous site-specific sediment-truth map. Critically,
+  this never divides MAR-012's `tau_max_p95_sensitivity_max_pa` (an
+  independent roughness-sensitivity envelope) by a D50-derived threshold:
+  for each candidate D50, `z0_skin_m = d50_m/12` drives BOTH a fresh
+  grain-related current/wave skin-friction recalculation (reusing MAR-012's
+  own validated friction-branch and Soulsby combined-stress functions
+  directly, per the ticket's own explicit reuse instruction, generalised
+  from MAR-010's fixed 1 m reference height to the raw MAR-009B sample's
+  own `height_above_model_bed_m`) AND the matching critical stress
+  (`D* = d50*[g*(s-1)/nu^2]^(1/3)`; `theta_cr = 0.30/(1+1.2*D*) +
+  0.055*[1-exp(-0.020*D*)]`; `tau_cr = theta_cr*(rho_sediment-rho_water)*g*d50`)
+  -- the SAME D50 drives both sides of the comparison. `mobility_ratio =
+  tau_max_grain_skin/tau_cr`; `>= 1` is threshold-crossing initiation-of-
+  motion POTENTIAL only, never erosion/transport/scour/risk. Reuses
+  MAR-012's verified coordinate-based hydro-pair reconciliation and
+  exact-timestamp join directly rather than re-deriving them. The discrete
+  `largest_tested_d50_with_p95_mobility_ratio_ge_1_mm` capacity field is
+  never reported above the largest tested scenario (a passing 16 mm instead
+  flags `CAPACITY_EXCEEDS_TESTED_GRAIN_SIZE_RANGE`), and `mobility_ratio_p95`
+  monotonicity across the nine scenarios is VERIFIED per hydro pair, never
+  assumed. BGS sediment evidence is used strictly: `mapped_250k_folk_class`
+  is regional context only, never converted to a numeric D50; the five
+  valid observed PSA D50 points are point context only
+  (`POINT_OBSERVATION_NOT_INTERPOLATED_TO_PIPELINE`, count always derived
+  from real data, never hard-coded); the BGS predictive product never
+  enters the physics. The primary map
+  (`maps/pl854_noncohesive_mobility_capacity.png`) colours the route with a
+  DISCRETE (never continuously interpolated) scale matching the nine
+  tested scenarios, overlaying the valid PSA points as visually distinct
+  markers that never influence route colour; a secondary chainage profile
+  PNG (`maps/pl854_mobility_capacity_profile.png`) shows the same stepped
+  capacity on a log D50 axis alongside the same PSA points at their own
+  true D50 and chainage.
+
+  Real execution against PL854 (no network) independently confirmed every
+  hand-computed threshold term (z0_skin, D*, theta_cr, tau_cr) bit-for-bit
+  across all nine scenarios, and reproduced the textbook Soulsby-Whitehouse
+  Shields-curve shape: theta_cr genuinely DIPS to a minimum (0.0302 at
+  D*=20.3, the 1 mm scenario) before rising again at coarser grain sizes
+  (0.0557 at D*=325, 16 mm) -- a real, unforced confirmation that the
+  formula was implemented correctly, not a monotonic curve fitted to
+  expectations. tau_cr itself still increases monotonically overall (0.120
+  Pa at 0.063 mm to 14.18 Pa at 16 mm). Route-wide mobility ratio and
+  threshold exceedance both decrease monotonically with grain size across
+  all 14 real hydro pairs (p95 exceedance 3.50/59.8% at 0.063 mm down to
+  0.114/0.0% at 16 mm) with ZERO monotonicity violations detected route-
+  wide -- verified, not assumed. p95 capacity is 1 mm for 12/14 segments
+  and 0.5 mm for 2/14, producing 655,074 combined 3-hourly rows (5,199
+  timestamps x 14 hydro pairs x 9 grain scenarios) and 126 stats rows (14 x
+  9) at 100% completeness. The five real valid observed PSA D50s (0.21-0.38
+  mm, all Folk class "S") sit comfortably below the computed capacity
+  ceiling -- a reassuring but never conflated cross-check between the
+  capacity model and real point observations. 53 new offline tests were
+  added across `test_noncohesive_mobility.py`,
+  `test_noncohesive_mobility_map.py`, and `test_cli.py`; the full offline
+  suite (724 tests) and repo-wide `ruff format`/`ruff check` pass clean. No
+  Shields threshold above this, transport rate, erosion, deposition, scour,
+  free-span, fatigue, or pipeline risk is computed anywhere in this ticket
+  -- no further ticket has started.

@@ -1698,3 +1698,311 @@ def test_build_combined_bed_shear_command_hard_fails_on_unreconcilable_coordinat
         or "UnreconciledHydroNodeError" in err
         or "unrelated grid cells" in err
     )
+
+
+# --- build-noncohesive-mobility (MAR-013) --------------------------------------------
+
+
+def test_build_noncohesive_mobility_command_requires_pipeline_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "no_pipeline.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-noncohesive-mobility", str(config_path)])
+
+    assert exit_code == 1
+    assert "pipeline.pipeline_id" in capsys.readouterr().err
+
+
+def test_build_noncohesive_mobility_command_requires_prior_outputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    processed_dir = tmp_path / "processed"
+    interim_dir = tmp_path / "interim"
+    config_path = tmp_path / "study.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n"
+        f"paths:\n  processed_dir: {processed_dir}\n  interim_dir: {interim_dir}\n"
+        "pipeline:\n  pipeline_id: PL854\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-noncohesive-mobility", str(config_path)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "build-metocean-evidence" in err
+    assert "build-wave-orbital-forcing" in err
+    assert "build-sediment-evidence" in err
+
+
+def _write_noncohesive_mobility_fixture(tmp_path: Path) -> Path:
+    """A minimal on-disk study with real MAR-009B/MAR-011A/MAR-008-shaped canonical
+    outputs already present -- current and wave nodes share IDENTICAL coordinates,
+    mirroring real PL854's own verified AMM15 grid alignment."""
+
+    processed_dir = tmp_path / "processed"
+    interim_dir = tmp_path / "interim"
+    config_path = tmp_path / "study.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n"
+        f"paths:\n  processed_dir: {processed_dir}\n  interim_dir: {interim_dir}\n"
+        "pipeline:\n  pipeline_id: PL854\n",
+        encoding="utf-8",
+    )
+
+    study_dir = processed_dir / "pl854"
+    metocean_interim_dir = interim_dir / "pl854" / "metocean"
+    metocean_processed_dir = study_dir / "metocean"
+    sediment_interim_dir = interim_dir / "pl854" / "sediment"
+    sediment_processed_dir = study_dir / "sediment"
+    for d in (
+        study_dir,
+        metocean_interim_dir,
+        metocean_processed_dir,
+        sediment_interim_dir,
+        sediment_processed_dir,
+    ):
+        d.mkdir(parents=True, exist_ok=True)
+
+    route = LineString([(500000.0, 5900000.0), (500500.0, 5900000.0), (501000.0, 5900300.0)])
+    pipeline_gdf = gpd.GeoDataFrame(
+        [{"pipeline_id": "PL854", "source": "test", "status": "ACTIVE"}],
+        geometry=[route],
+        crs="EPSG:32631",
+    )
+    pipeline_gdf.to_file(study_dir / "pipeline.gpkg", driver="GPKG", layer="pipeline")
+
+    current_nodes_df = pd.DataFrame(
+        [
+            {
+                "node_id": "current_A",
+                "longitude": 1.666667,
+                "latitude": 53.364861,
+                "model_bathymetry_m": 26.0,
+            },
+            {
+                "node_id": "current_B",
+                "longitude": 1.696970,
+                "latitude": 53.364861,
+                "model_bathymetry_m": 29.0,
+            },
+        ]
+    )
+    current_nodes_df.to_parquet(metocean_interim_dir / "current_primary_support_nodes.parquet")
+
+    wave_nodes_df = pd.DataFrame(
+        [
+            {
+                "node_id": "wave_A",
+                "longitude": 1.666667,
+                "latitude": 53.364861,
+                "model_bathymetry_m": 26.0,
+            },
+            {
+                "node_id": "wave_B",
+                "longitude": 1.696970,
+                "latitude": 53.364861,
+                "model_bathymetry_m": 29.0,
+            },
+        ]
+    )
+    wave_nodes_df.to_parquet(metocean_interim_dir / "wave_support_nodes.parquet")
+
+    current_times = pd.date_range("2025-01-01", periods=9, freq="h", tz="UTC")
+    current_rows = []
+    for node_id in ("current_A", "current_B"):
+        for t in current_times:
+            current_rows.append(
+                {
+                    "current_node_id": node_id,
+                    "time_utc": t,
+                    "uo_m_s": 0.4,
+                    "vo_m_s": 0.1,
+                    "current_speed_m_s": float((0.4**2 + 0.1**2) ** 0.5),
+                    "current_direction_to_deg": 75.96,
+                    "current_sample_depth_m": 24.0,
+                    "model_bathymetry_m": 27.0,
+                    "height_above_model_bed_m": 3.0,
+                    "height_above_model_bed_valid": True,
+                    "source_dataset": "TEST_DATASET",
+                    "temporal_role": "PRIMARY_CURRENT",
+                }
+            )
+    pd.DataFrame(current_rows).to_parquet(metocean_interim_dir / "current_primary_hourly.parquet")
+
+    wave_times = pd.date_range("2025-01-01", periods=3, freq="3h", tz="UTC")
+    wave_rows = []
+    for node_id in ("wave_A", "wave_B"):
+        for t in wave_times:
+            wave_rows.append(
+                {
+                    "wave_node_id": node_id,
+                    "time_utc": t,
+                    "wave_orbital_velocity_rms_near_bed_m_s": 0.2,
+                    "wave_orbital_velocity_equivalent_amplitude_m_s": float(2.0**0.5 * 0.2),
+                    "equivalent_peak_period_from_tz_s": 1.28 * 6.0,
+                    "tp_s": 8.0,
+                    "wave_mean_direction_to_deg": 90.0,
+                }
+            )
+    pd.DataFrame(wave_rows).to_parquet(
+        metocean_interim_dir / "wave_orbital_velocity_3hourly.parquet"
+    )
+
+    chainage_metocean_df = pd.DataFrame(
+        {
+            "station_index": [0, 1, 2, 3],
+            "chainage_m": [0.0, 500.0, 1000.0, 1500.0],
+            "current_node_id": ["current_A", "current_A", "current_B", "current_B"],
+            "current_node_distance_m": [50.0, 60.0, 70.0, 80.0],
+            "wave_node_id": ["wave_A", "wave_A", "wave_B", "wave_B"],
+            "wave_node_distance_m": [55.0, 65.0, 75.0, 85.0],
+        }
+    )
+    chainage_metocean_df.to_parquet(metocean_processed_dir / "chainage_metocean_evidence.parquet")
+
+    chainage_sediment_df = pd.DataFrame(
+        {
+            "station_index": [0, 1, 2, 3],
+            "chainage_m": [0.0, 500.0, 1000.0, 1500.0],
+            "mapped_250k_folk_class": ["gS", "gS", "S", "S"],
+            "mapped_250k_nominal_scale": [250000, 250000, 250000, 250000],
+        }
+    )
+    chainage_sediment_df.to_parquet(sediment_processed_dir / "chainage_sediment_evidence.parquet")
+
+    psa_rows = [
+        {
+            "psa_data_id": 1,
+            "sample_date": "1980-09-17",
+            "sample_year": 1980,
+            "sample_age_years_at_run": 45,
+            "surface_evidence_class": "SURFACE_GRAB",
+            "grain_percentile_status": "DERIVED_FROM_NORMALIZED_MASS_BINS",
+            "d10_mm": 0.2,
+            "d50_mm": 0.35,
+            "d90_mm": 0.8,
+            "folk_class": "S",
+            "gravel": 0.5,
+            "sand": 99.0,
+            "mud": 0.5,
+            "distance_to_pipeline_m": 1200.0,
+            "nearest_pipeline_chainage_m": 500.0,
+            "nearest_pipeline_kp": "KP 0+500",
+            "longitude": 1.68,
+            "latitude": 53.37,
+        },
+        {
+            "psa_data_id": 2,
+            "sample_date": "1979-08-17",
+            "sample_year": 1979,
+            "sample_age_years_at_run": 46,
+            "surface_evidence_class": "SURFACE_GRAB",
+            "grain_percentile_status": "DERIVED_FROM_NORMALIZED_MASS_BINS",
+            "d10_mm": 0.22,
+            "d50_mm": 0.38,
+            "d90_mm": 0.58,
+            "folk_class": "S",
+            "gravel": 0.87,
+            "sand": 98.95,
+            "mud": 0.18,
+            "distance_to_pipeline_m": 3338.4,
+            "nearest_pipeline_chainage_m": 1500.0,
+            "nearest_pipeline_kp": "KP 1+500",
+            "longitude": 1.70,
+            "latitude": 53.365,
+        },
+    ]
+    pd.DataFrame(psa_rows).to_parquet(sediment_interim_dir / "bgs_psa_observations.parquet")
+
+    return config_path
+
+
+def test_build_noncohesive_mobility_command_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_noncohesive_mobility_fixture(tmp_path)
+
+    exit_code = main(["build-noncohesive-mobility", str(config_path)])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "MAP COLOURS SHOW THE LARGEST TESTED NONCOHESIVE GRAIN SIZE" in output
+    assert "NOT A CONTINUOUS SITE-SPECIFIC" in output
+    assert "OBSERVED D50 POINTS WERE NOT INTERPOLATED" in output
+    assert "BGS 250K FOLK CLASSES WERE NOT CONVERTED TO NUMERIC D50" in output
+
+    processed_dir = tmp_path / "processed" / "pl854"
+    interim_dir = tmp_path / "interim" / "pl854"
+    mobility_hourly_path = interim_dir / "sediment" / "noncohesive_mobility_3hourly.parquet"
+    stats_path = processed_dir / "sediment" / "noncohesive_mobility_stats.parquet"
+    observed_context_path = processed_dir / "sediment" / "observed_d50_context.parquet"
+    segments_path = processed_dir / "sediment" / "noncohesive_mobility_capacity_segments.gpkg"
+    png_path = processed_dir / "maps" / "pl854_noncohesive_mobility_capacity.png"
+    profile_path = processed_dir / "maps" / "pl854_mobility_capacity_profile.png"
+    metadata_path = processed_dir / "sediment" / "noncohesive_mobility_metadata.json"
+
+    for path in (
+        mobility_hourly_path,
+        stats_path,
+        observed_context_path,
+        segments_path,
+        png_path,
+        profile_path,
+        metadata_path,
+    ):
+        assert path.exists(), path
+
+    mobility_df = pd.read_parquet(mobility_hourly_path)
+    # 3 shared 3-hourly timestamps x 2 hydro pairs x 9 grain scenarios.
+    assert len(mobility_df) == 3 * 2 * 9
+    assert set(mobility_df["tested_d50_mm"].unique()) == {
+        0.063,
+        0.125,
+        0.250,
+        0.500,
+        1.000,
+        2.000,
+        4.000,
+        8.000,
+        16.000,
+    }
+    assert (mobility_df["tau_current_skin_pa"] > 0).all()
+    assert (mobility_df["tau_wave_skin_pa"] > 0).all()
+    assert not any("folk" in c.lower() for c in mobility_df.columns)
+    assert not any("predictive" in c.lower() for c in mobility_df.columns)
+
+    observed_context_df = pd.read_parquet(observed_context_path)
+    assert len(observed_context_df) == 2
+
+    segments_gdf = gpd.read_file(segments_path, layer="noncohesive_mobility_capacity_segments")
+    assert len(segments_gdf) == 2  # one contiguous section per hydro pair
+    assert set(segments_gdf["mapped_250k_folk_class"].unique()) <= {"gS", "S"}
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["scientific_role"] == "NONCOHESIVE_SEDIMENT_MOBILITY_CAPACITY"
+    assert metadata["bgs_folk_to_numeric_d50_mapping_applied"] is False
+    assert metadata["psa_d50_interpolation_applied"] is False
+    assert metadata["bgs_predictive_sediment_used_in_physics"] is False
+    assert metadata["continuous_pipeline_d50_field_created"] is False
+    assert len(metadata["tested_d50_scenarios_mm"]) == 9
+    assert png_path.stat().st_size > 0
+    assert profile_path.stat().st_size > 0
+
+
+def test_build_noncohesive_mobility_command_is_idempotent_offline(tmp_path: Path) -> None:
+    """No network/Copernicus/BGS dependency -- running twice against the same
+    fixture succeeds."""
+
+    config_path = _write_noncohesive_mobility_fixture(tmp_path)
+
+    first_exit_code = main(["build-noncohesive-mobility", str(config_path)])
+    second_exit_code = main(["build-noncohesive-mobility", str(config_path)])
+
+    assert first_exit_code == 0
+    assert second_exit_code == 0
