@@ -1,5 +1,6 @@
 """Tests for the marine_engine CLI entry point."""
 
+import json
 from pathlib import Path
 
 import geopandas as gpd
@@ -1046,3 +1047,170 @@ def test_build_metocean_evidence_command_reports_authentication_required(
 
     assert exit_code == 1
     assert "Copernicus Marine credentials are not configured" in capsys.readouterr().err
+
+
+# --- build-current-normalization (MAR-010) ------------------------------------------
+
+
+def test_build_current_normalization_command_requires_pipeline_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "no_pipeline.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-current-normalization", str(config_path)])
+
+    assert exit_code == 1
+    assert "pipeline.pipeline_id" in capsys.readouterr().err
+
+
+def test_build_current_normalization_command_requires_prior_outputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Section 12: must require the MAR-009B canonical outputs already exist."""
+
+    processed_dir = tmp_path / "processed"
+    interim_dir = tmp_path / "interim"
+    config_path = tmp_path / "study.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n"
+        f"paths:\n  processed_dir: {processed_dir}\n  interim_dir: {interim_dir}\n"
+        "pipeline:\n  pipeline_id: PL854\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-current-normalization", str(config_path)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "build-metocean-evidence" in err
+
+
+def _write_current_normalization_fixture(tmp_path: Path) -> Path:
+    """A minimal on-disk study with real MAR-009B-shaped canonical outputs already present."""
+
+    processed_dir = tmp_path / "processed"
+    interim_dir = tmp_path / "interim"
+    config_path = tmp_path / "study.yaml"
+    config_path.write_text(
+        "study:\n  id: X\n  name: Test\ncrs:\n  horizontal: 'EPSG:32631'\n"
+        f"paths:\n  processed_dir: {processed_dir}\n  interim_dir: {interim_dir}\n"
+        "pipeline:\n  pipeline_id: PL854\n",
+        encoding="utf-8",
+    )
+
+    study_dir = processed_dir / "pl854"
+    metocean_interim_dir = interim_dir / "pl854" / "metocean"
+    metocean_processed_dir = study_dir / "metocean"
+    study_dir.mkdir(parents=True, exist_ok=True)
+    metocean_interim_dir.mkdir(parents=True, exist_ok=True)
+    metocean_processed_dir.mkdir(parents=True, exist_ok=True)
+
+    # A gently bent route so the segment-geometry test has something real to check.
+    route = LineString([(500000.0, 5900000.0), (500500.0, 5900000.0), (501000.0, 5900300.0)])
+    pipeline_gdf = gpd.GeoDataFrame(
+        [{"pipeline_id": "PL854", "source": "test", "status": "ACTIVE"}],
+        geometry=[route],
+        crs="EPSG:32631",
+    )
+    pipeline_gdf.to_file(study_dir / "pipeline.gpkg", driver="GPKG", layer="pipeline")
+
+    nodes_df = pd.DataFrame(
+        [
+            {"node_id": "current_A", "model_bathymetry_m": 25.0},
+            {"node_id": "current_B", "model_bathymetry_m": 30.0},
+        ]
+    )
+    nodes_df.to_parquet(metocean_interim_dir / "current_primary_support_nodes.parquet")
+
+    times = pd.date_range("2025-01-01", periods=6, freq="h", tz="UTC")
+    hourly_rows = []
+    for node_id, bathymetry, height in (("current_A", 25.0, 3.0), ("current_B", 30.0, 4.0)):
+        for t in times:
+            hourly_rows.append(
+                {
+                    "current_node_id": node_id,
+                    "time_utc": t,
+                    "uo_m_s": 0.2,
+                    "vo_m_s": 0.1,
+                    "current_speed_m_s": float((0.2**2 + 0.1**2) ** 0.5),
+                    "current_sample_depth_m": bathymetry - height,
+                    "model_bathymetry_m": bathymetry,
+                    "height_above_model_bed_m": height,
+                    "height_above_model_bed_valid": True,
+                    "source_dataset": "TEST_DATASET",
+                }
+            )
+    pd.DataFrame(hourly_rows).to_parquet(metocean_interim_dir / "current_primary_hourly.parquet")
+
+    chainage_df = pd.DataFrame(
+        {
+            "chainage_m": [0.0, 500.0, 1000.0, 1500.0],
+            "current_node_id": ["current_A", "current_A", "current_B", "current_B"],
+            "current_node_distance_m": [50.0, 60.0, 70.0, 80.0],
+        }
+    )
+    chainage_df.to_parquet(metocean_processed_dir / "chainage_metocean_evidence.parquet")
+
+    return config_path
+
+
+def test_build_current_normalization_command_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_current_normalization_fixture(tmp_path)
+
+    exit_code = main(["build-current-normalization", str(config_path)])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "MAP COLOURS REPRESENT NATIVE CORRECTED REFERENCE-CURRENT P95" in output
+    assert "MAR-010 IS CURRENT-ONLY" in output
+
+    processed_dir = tmp_path / "processed" / "pl854"
+    interim_dir = tmp_path / "interim" / "pl854"
+    hourly_path = interim_dir / "metocean" / "current_only_1m_sensitivity_hourly.parquet"
+    stats_path = processed_dir / "metocean" / "current_only_1m_sensitivity_stats.parquet"
+    segments_path = processed_dir / "metocean" / "current_reference_segments.gpkg"
+    png_path = processed_dir / "maps" / "pl854_reference_current_forcing.png"
+    metadata_path = processed_dir / "metocean" / "current_normalization_metadata.json"
+
+    for path in (hourly_path, stats_path, segments_path, png_path, metadata_path):
+        assert path.exists(), path
+
+    hourly_df = pd.read_parquet(hourly_path)
+    assert len(hourly_df) == 6 * 2 * 5  # 6 hours x 2 nodes x 5 roughness scenarios
+    assert set(hourly_df["roughness_scenario"].unique()) == {
+        "SILT",
+        "FINE_SAND",
+        "MEDIUM_SAND",
+        "COARSE_SAND",
+        "GRAVEL",
+    }
+
+    stats_df = pd.read_parquet(stats_path)
+    assert set(stats_df["current_node_id"].unique()) == {"current_A", "current_B"}
+
+    segments_gdf = gpd.read_file(segments_path, layer="current_reference_segments")
+    assert len(segments_gdf) == 2  # one contiguous section per node
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["scientific_role"] == "CURRENT_ONLY_LOG_PROFILE_SENSITIVITY"
+    assert metadata["current_wave_interaction_applied"] is False
+    assert metadata["canonical_LAT_bathymetry_not_used_in_vertical_scaling"] is True
+    assert png_path.stat().st_size > 0
+
+
+def test_build_current_normalization_command_is_idempotent_offline(tmp_path: Path) -> None:
+    """No network/Copernicus dependency -- running twice against the same fixture succeeds."""
+
+    config_path = _write_current_normalization_fixture(tmp_path)
+
+    first_exit_code = main(["build-current-normalization", str(config_path)])
+    second_exit_code = main(["build-current-normalization", str(config_path)])
+
+    assert first_exit_code == 0
+    assert second_exit_code == 0

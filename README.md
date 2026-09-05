@@ -518,3 +518,57 @@ otherwise, never an interactive credential prompt.
   clean. No bed shear stress, Shields parameter, sediment mobility,
   erosion/deposition, scour, free-span, fatigue, or risk scoring is
   computed anywhere in this ticket -- no further ticket has started.
+- `MAR-010`: current-only near-bed normalization
+  (`metocean/{current_normalization,current_map}.py`) -- the first step
+  beyond forcing evidence, and the first static map in this project.
+  Normalizes the MAR-009B corrected primary-current reference sample
+  (`deepest_valid_standard_level_current`, 0.243-4.868 m above the
+  Copernicus model bed) to a standard 1.0 m above that SAME model bed,
+  using the ticket's fixed logarithmic velocity-profile ratio
+  `S(z_t,z_r,z0) = [ln(z_t+z0)-ln(z0)]/[ln(z_r+z0)-ln(z0)]` --
+  `uo_1m/vo_1m = S * uo_ref/vo_ref` preserves direction exactly (`S` is a
+  positive scalar shared by both components). Canonical role name
+  `CURRENT_ONLY_LOG_PROFILE_SENSITIVITY` throughout -- never "bed
+  current"/"seabed current"/"combined near-bed current" (this is
+  current-only; wave-current bottom-boundary-layer interaction is
+  explicitly deferred, `current_wave_interaction_applied = false`).
+  Roughness is run as five FIXED sensitivity scenarios (SILT 5e-6 m
+  through GRAVEL 3e-4 m, consistent with long-standing DNV F105/F109
+  roughness classes without claiming certified compliance) -- never a
+  canonical PL854 seabed roughness choice, never a BGS-Folk mapping, never
+  a D50-derived field, never averaged into a "best estimate"; the
+  sensitivity envelope (min/max across the five) is itself the output.
+  Every row also carries `z_r_over_h_model` and an explicitly-named
+  `log_profile_vertical_domain_status` against a conservative 0.30
+  project screening heuristic (never a universal physical threshold) --
+  rows outside it get null normalized values, never a silent
+  extrapolation. `NormalizationCompletenessError` mirrors MAR-009B's own
+  completeness invariant for this derived product.
+
+  Contiguous current-support map sections (`current_reference_segments.gpkg`)
+  dissolve runs of chainage stations sharing one real support node using
+  `shapely.ops.substring` on the true canonical route geometry -- never a
+  straight chord between chainage points, never 941 independently-coloured
+  25 m cells (honest ~1.5 km model spatial support). The required static
+  map (`maps/pl854_reference_current_forcing.png`, matplotlib + rasterio,
+  `Agg` backend, a newly-declared project dependency) colours the route by
+  the assumption-minimal `current_reference_speed_p95_m_s` only -- never
+  one arbitrary roughness scenario's 1 m value, never a risk judgement --
+  with a muted EMODnet bathymetry background, KP labels, scale bar, north
+  arrow, and the top-3 native-p95 sections called out; endpoints stay
+  "Source geometry start"/"Source geometry terminus" per the project's
+  established direction-honesty stance.
+
+  Real execution against PL854 confirms the vertical screen independently
+  (never hard-coded): **0 of 260,400 canonical rows fall outside the 0.30
+  screen** (z_r/h_model max = 0.163), producing exactly 1,302,000 hourly
+  sensitivity rows (260,400 x 5) and a 70-row (14 nodes x 5 scenarios)
+  stats table, 14 contiguous map sections (one per real route-used node,
+  tiling the full 23,480.67 m route with zero gaps), and a rendered PNG.
+  40 new offline tests were added across `test_current_normalization.py`,
+  `test_current_map.py`, and `test_cli.py` (including a full synthetic
+  end-to-end CLI fixture); the full offline suite (557 tests) and
+  repo-wide `ruff format`/`ruff check` pass clean. No bed shear stress,
+  Shields parameter, sediment mobility, scour, free-span, erosion/
+  deposition, or risk scoring is computed anywhere in this ticket -- no
+  further ticket has started.

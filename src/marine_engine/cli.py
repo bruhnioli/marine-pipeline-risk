@@ -1,6 +1,7 @@
 """Minimal command-line entry point for the marine-engine package."""
 
 import argparse
+import json
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ from shapely.ops import unary_union
 
 from marine_engine import __version__
 from marine_engine.config import load_study_config
+from marine_engine.metocean import current_map, current_normalization
 from marine_engine.metocean import evidence as metocean_evidence
 from marine_engine.morphology import regional
 from marine_engine.preprocessing import bathymetry, source_resolution
@@ -1741,6 +1743,279 @@ def _cmd_build_metocean_evidence(args: argparse.Namespace) -> int:
     return 0
 
 
+def _none_if_nan(value: Any) -> Any:
+    """`None` for a missing/NaN scalar, else `float(value)` -- JSON/dataclass-safe."""
+
+    if value is None:
+        return None
+    if isinstance(value, float) and np.isnan(value):
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return float(value)
+
+
+def _cmd_build_current_normalization(args: argparse.Namespace) -> int:
+    """MAR-010: current-only 1 m log-profile normalization sensitivity + reference map.
+
+    Requires the MAR-009B canonical primary-current outputs to already
+    exist on disk; performs NO network request and NO Copernicus
+    acquisition (Section 12) -- everything it reads was already downloaded
+    and normalized by `build-metocean-evidence`.
+    """
+
+    config = load_study_config(args.config)
+    pipeline_id = config.pipeline.get("pipeline_id")
+    if not pipeline_id:
+        print(f"error: '{args.config}' has no pipeline.pipeline_id configured", file=sys.stderr)
+        return 1
+
+    pipeline_gpkg_path, _aoi_gpkg_path, _chainage_gpkg_path, interim_dir = _study_paths(
+        config, pipeline_id
+    )
+    study_dir = config.paths.processed_dir / pipeline_id.lower()
+    metocean_interim_dir = interim_dir / "metocean"
+    metocean_processed_dir = study_dir / "metocean"
+    maps_dir = study_dir / "maps"
+
+    primary_nodes_path = metocean_interim_dir / "current_primary_support_nodes.parquet"
+    primary_hourly_path = metocean_interim_dir / "current_primary_hourly.parquet"
+    chainage_metocean_path = metocean_processed_dir / "chainage_metocean_evidence.parquet"
+    required_paths = (
+        pipeline_gpkg_path,
+        primary_nodes_path,
+        primary_hourly_path,
+        chainage_metocean_path,
+    )
+    missing = [str(p) for p in required_paths if not p.exists()]
+    if missing:
+        print(
+            "error: missing required canonical output(s) -- run build-chainage and "
+            f"build-metocean-evidence first: {missing}",
+            file=sys.stderr,
+        )
+        return 1
+
+    working_crs = config.crs.horizontal
+    try:
+        route, _attributes, source_crs = load_pipeline_route(pipeline_gpkg_path, pipeline_id)
+    except InvalidPipelineRouteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if source_crs != working_crs:
+        print(
+            f"error: pipeline CRS {source_crs} does not match configured working CRS {working_crs}",
+            file=sys.stderr,
+        )
+        return 1
+
+    primary_nodes_df = pd.read_parquet(primary_nodes_path)
+    primary_hourly_df = pd.read_parquet(primary_hourly_path)
+    chainage_metocean_df = pd.read_parquet(chainage_metocean_path)
+
+    # --- MAR-010 core: log-profile 1 m sensitivity normalization -----------
+    try:
+        hourly_sensitivity_df = current_normalization.build_current_only_1m_sensitivity_hourly(
+            primary_hourly_df
+        )
+        sensitivity_stats_df = current_normalization.compute_current_only_1m_sensitivity_stats(
+            hourly_sensitivity_df
+        )
+        current_stats = metocean_evidence.compute_current_node_statistics(primary_hourly_df)
+    except (
+        current_normalization.NormalizationCompletenessError,
+        metocean_evidence.TemporalCompletenessError,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    sensitivity_envelope_df = current_normalization.compute_current_only_1m_sensitivity_envelope(
+        sensitivity_stats_df
+    )
+    sensitivity_stats_df = sensitivity_stats_df.merge(
+        sensitivity_envelope_df, on="current_node_id", how="left"
+    )
+    vertical_domain_summary = current_normalization.compute_vertical_domain_summary(
+        hourly_sensitivity_df
+    )
+
+    # --- per-node reference attributes for segment/map assembly ------------
+    node_bathymetry_by_id = primary_nodes_df.set_index("node_id")["model_bathymetry_m"].to_dict()
+    current_stats_by_id = current_stats.set_index("current_node_id")
+    envelope_by_id = sensitivity_envelope_df.set_index("current_node_id")
+
+    node_attributes_by_id: dict[str, current_map.NodeReferenceAttributes] = {}
+    for node_id, stats_row in current_stats_by_id.iterrows():
+        bathymetry_m = node_bathymetry_by_id.get(node_id)
+        representative_depth_m = stats_row.get("representative_sample_depth_m")
+        reference_height_m = (
+            bathymetry_m - representative_depth_m
+            if bathymetry_m is not None and pd.notna(representative_depth_m)
+            else None
+        )
+        envelope_row = envelope_by_id.loc[node_id] if node_id in envelope_by_id.index else None
+        node_attributes_by_id[node_id] = current_map.NodeReferenceAttributes(
+            model_bathymetry_m=_none_if_nan(bathymetry_m),
+            reference_height_m=_none_if_nan(reference_height_m),
+            speed_mean_m_s=_none_if_nan(stats_row.get("current_speed_mean_m_s")),
+            speed_p95_m_s=_none_if_nan(stats_row.get("current_speed_p95_m_s")),
+            speed_p99_m_s=_none_if_nan(stats_row.get("current_speed_p99_m_s")),
+            speed_max_m_s=_none_if_nan(stats_row.get("current_speed_max_m_s")),
+            sensitivity_p95_min_m_s=_none_if_nan(envelope_row["speed_1m_p95_sensitivity_min_m_s"])
+            if envelope_row is not None
+            else None,
+            sensitivity_p95_max_m_s=_none_if_nan(envelope_row["speed_1m_p95_sensitivity_max_m_s"])
+            if envelope_row is not None
+            else None,
+            sensitivity_p95_width_m_s=_none_if_nan(
+                envelope_row["speed_1m_p95_sensitivity_width_m_s"]
+            )
+            if envelope_row is not None
+            else None,
+        )
+
+    # --- contiguous map segments ---------------------------------------------
+    chainage_current_df = chainage_metocean_df[
+        ["chainage_m", "current_node_id", "current_node_distance_m"]
+    ].copy()
+    segments_gdf = current_map.build_current_reference_segments(
+        pipeline_id=pipeline_id,
+        route=route,
+        chainage_current_df=chainage_current_df,
+        node_attributes_by_id=node_attributes_by_id,
+        working_crs=working_crs,
+    )
+    distance_diagnostics = metocean_evidence.compute_distance_diagnostics(
+        chainage_current_df.rename(columns={"current_node_distance_m": "distance_m"})
+    )
+
+    # --- write parquet/gpkg outputs ------------------------------------------
+    hourly_path = metocean_evidence.write_parquet(
+        hourly_sensitivity_df,
+        metocean_interim_dir / "current_only_1m_sensitivity_hourly.parquet",
+    )
+    stats_path = metocean_evidence.write_parquet(
+        sensitivity_stats_df, metocean_processed_dir / "current_only_1m_sensitivity_stats.parquet"
+    )
+    segments_path = current_map.write_current_reference_segments_gpkg(
+        segments_gdf, metocean_processed_dir / "current_reference_segments.gpkg"
+    )
+
+    background_raster_path = study_dir / "bathymetry" / "emodnet_baseline_lat_100m.tif"
+    png_path = current_map.render_reference_current_map(
+        segments_gdf=segments_gdf,
+        route=route,
+        working_crs=working_crs,
+        output_path=maps_dir / "pl854_reference_current_forcing.png",
+        background_raster_path=(
+            background_raster_path if background_raster_path.exists() else None
+        ),
+    )
+    png_dimensions = current_map.read_png_dimensions(png_path)
+
+    # --- metadata --------------------------------------------------------------
+    metadata_path = metocean_processed_dir / "current_normalization_metadata.json"
+    metadata = {
+        "scientific_role": current_normalization.SCIENTIFIC_ROLE,
+        "target_height_above_model_bed_m": (current_normalization.TARGET_HEIGHT_ABOVE_MODEL_BED_M),
+        "equation": (
+            "S(z_t,z_r,z0) = [ln(z_t+z0)-ln(z0)] / [ln(z_r+z0)-ln(z0)]; "
+            "uo_1m = S * uo_ref; vo_1m = S * vo_ref; "
+            "speed_1m = sqrt(uo_1m^2 + vo_1m^2)"
+        ),
+        "roughness_scenarios_m": dict(current_normalization.ROUGHNESS_SCENARIOS_M),
+        "roughness_semantics": "SENSITIVITY_SCENARIOS_NOT_SITE_SPECIFIC_BED_TRUTH",
+        "vertical_domain_screen": current_normalization.VERTICAL_DOMAIN_SCREEN_FRACTION,
+        "vertical_domain_screen_semantics": (
+            "A conservative project data-QA validity screen (z_r_over_h_model <= 0.30) for "
+            "applying this simple current-only log-profile formulation at all -- never a "
+            "universal physical threshold."
+        ),
+        "z_r_source": "Copernicus model bathymetry - deepest physically valid standard depth",
+        "canonical_LAT_bathymetry_not_used_in_vertical_scaling": True,
+        "current_wave_interaction_applied": False,
+        "pipeline_directionality_applied": False,
+        "current_source_nominal_resolution_m": current_map.SOURCE_GRID_NOMINAL_RESOLUTION_M,
+        "map_colour_variable": "current_reference_speed_p95_m_s",
+        "wave_interaction_statement": (
+            "Surface waves can modify the apparent roughness and mean-current profile in "
+            "the bottom boundary layer. MAR-010 intentionally does not model that "
+            "interaction; this is a current-only normalization sensitivity product."
+        ),
+        "limitations": [
+            "Roughness scenarios are fixed sensitivity dimensions, not a site-specific "
+            "PL854 seabed roughness estimate.",
+            "The 0.30 vertical-domain screen is a conservative project heuristic, not a "
+            "universal physical threshold.",
+            "Wave-current bottom-boundary-layer interaction is not modelled here.",
+            "Model bathymetry (used here) and canonical MAR-006 LAT bathymetry remain "
+            "deliberately unharmonised.",
+            "Map colours represent the native corrected reference-current p95 only, not "
+            "any roughness-selected or risk value.",
+        ],
+        "references": [
+            {
+                "citation": "Soulsby, R. (1997), Dynamics of Marine Sands.",
+                "doi": "10.1680/doms.25844",
+            },
+            {
+                "citation": (
+                    "Grant, W.D. & Madsen, O.S. (1979), Combined wave and current "
+                    "interaction with a rough bottom."
+                ),
+                "doi": "10.1029/JC084iC04p01797",
+            },
+            {
+                "citation": (
+                    "Warner, J.C. et al. (2008), Development of a three-dimensional, "
+                    "regional, coupled wave, current, and sediment-transport model."
+                ),
+                "doi": "10.1016/j.cageo.2008.02.012",
+            },
+        ],
+        "roughness_reference_note": (
+            "The roughness sensitivity values are consistent with long-standing DNV "
+            "F105/F109 seabed roughness classes, but this does not claim certified "
+            "compliance with the current licensed DNV editions."
+        ),
+        "vertical_domain_summary": vertical_domain_summary,
+        "outputs": {
+            "current_only_1m_sensitivity_hourly": str(hourly_path),
+            "current_only_1m_sensitivity_stats": str(stats_path),
+            "current_reference_segments": str(segments_path),
+            "current_reference_map_png": str(png_path),
+        },
+    }
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+
+    print(
+        f"Current-only 1 m sensitivity (hourly): {len(hourly_sensitivity_df)} row(s) -> "
+        f"{hourly_path}"
+    )
+    print(
+        f"Current-only 1 m sensitivity (stats): {len(sensitivity_stats_df)} row(s) -> {stats_path}"
+    )
+    print(f"Current reference segments: {len(segments_gdf)} section(s) -> {segments_path}")
+    print(f"Reference current map: {png_path}")
+    print(f"Metadata: {metadata_path}")
+    print()
+    current_map.print_current_normalization_report(
+        vertical_domain_summary=vertical_domain_summary,
+        sensitivity_stats_df=sensitivity_stats_df,
+        segments_gdf=segments_gdf,
+        route_used_node_count=len(current_stats),
+        distance_diagnostics=distance_diagnostics,
+        segments_path=segments_path,
+        png_path=png_path,
+        png_dimensions=png_dimensions,
+    )
+    return 0
+
+
 def _dataset_start_or(time_range_ms: tuple | None, fallback_now: datetime) -> datetime:
     """The live dataset's own start timestamp, or `fallback_now` if it could not be discovered."""
 
@@ -1866,6 +2141,19 @@ def build_parser() -> argparse.ArgumentParser:
         "config", type=Path, help="Path to a study config YAML file."
     )
     build_metocean_evidence_parser.set_defaults(func=_cmd_build_metocean_evidence)
+
+    build_current_normalization_parser = subparsers.add_parser(
+        "build-current-normalization",
+        help=(
+            "Build the current-only 1 m log-profile near-bed normalization sensitivity "
+            "(MAR-010) and render the reference-current map -- no network, requires "
+            "build-metocean-evidence to have already run."
+        ),
+    )
+    build_current_normalization_parser.add_argument(
+        "config", type=Path, help="Path to a study config YAML file."
+    )
+    build_current_normalization_parser.set_defaults(func=_cmd_build_current_normalization)
 
     return parser
 

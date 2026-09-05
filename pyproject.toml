@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "copernicusmarine>=2.1.1",
     "geopandas>=1.1.4",
+    "matplotlib>=3.11.1",
     "pyarrow>=25.0.1",
     "pydantic>=2.13.5",
     "pyproj>=3.7.2",
